@@ -2,32 +2,59 @@
 import json
 import re
 import threading
-
-import pymysql
-from dbutils.pooled_db import PooledDB
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import config as _config
+import local_store
+
+_source = ContextVar("data_source", default="wzyp")
+
+
+def active_source():
+    return _source.get()
+
+
+@contextmanager
+def use_source(source):
+    if source not in {"wzyp", "16688"}:
+        raise ValueError("未知数据源")
+    token = _source.set(source)
+    try:
+        yield
+    finally:
+        _source.reset(token)
 
 
 def _build_pool():
+    import pymysql
+    from dbutils.pooled_db import PooledDB
     return PooledDB(
-        creator=pymysql, maxconnections=6, mincached=1, maxcached=3,
-        blocking=True, ping=1, **_config.get_db_config())
+        creator=pymysql, maxconnections=6, mincached=0, maxcached=3,
+        blocking=True, ping=1, connect_timeout=8, read_timeout=20, **_config.get_db_config())
 
 
-_pool = _build_pool()
+_pool = None
+_pool_lock = threading.Lock()
 
 
 def rebuild_pool():
     """DB 配置变更后重建连接池"""
     global _pool
-    try:
-        _pool.connections.close()
-    except Exception:
-        pass
-    _pool = _build_pool()
+    with _pool_lock:
+        if _pool is not None:
+            _pool.close()
+        _pool = None
 
 def query(sql, args=None, one=False):
+    if active_source() == "16688":
+        rows = local_store.readonly_query(sql, args)
+        return (rows[0] if rows else None) if one else rows
+    import pymysql
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            _pool = _build_pool()
     conn = _pool.connection()
     try:
         with conn.cursor(pymysql.cursors.DictCursor) as cur:
@@ -63,6 +90,9 @@ def build_filters(specs, column_map):
             clauses.append(f"{col} LIKE %s"); args.append(f"%{v}%")
         elif op == "IN":
             vals = v if isinstance(v, list) else [x for x in str(v).split(",") if x]
+            if not vals:
+                clauses.append("1=0")
+                continue
             ph = ",".join(["%s"] * len(vals))
             clauses.append(f"{col} IN ({ph})"); args.extend(vals)
         else:
@@ -80,9 +110,11 @@ def list_shops(kw=None, filters=None, fetch_status=None, sort="goods_count", ord
         "card_count": "s.card_count", "article_count": "s.article_count",
         "resource_count": "s.resource_count", "equity_count": "s.equity_count",
         "auth_status": "s.auth_status", "shop_newbie": "s.shop_newbie",
-        "create_time": "s.create_time", "avg_price": "avg_price",
-        "min_price": "min_price", "max_price": "max_price",
+        "create_time": "s.create_time", "avg_price": "s.avg_price",
+        "min_price": "s.min_price", "max_price": "s.max_price",
     }
+    if active_source() == "16688":
+        cols.update({field: f"s.{field}" for field in ("auto_count", "manual_count", "unknown_count")})
     where, args = build_filters(filters, cols)
     if fetch_status == "done":
         where = f"({where}) AND s.fetch_done = 1 AND s.goods_count > 0"
@@ -94,27 +126,28 @@ def list_shops(kw=None, filters=None, fetch_status=None, sort="goods_count", ord
         k = f"%{kw}%"
         where = f"({where}) AND (s.token LIKE %s OR s.nickname LIKE %s OR s.contact_qq LIKE %s)"
         args = args + [k, k, k]
-    sort = sort if sort in SHOP_SORTABLE else "goods_count"
+    sortable = SHOP_SORTABLE | ({"auto_count", "manual_count", "unknown_count"} if active_source() == "16688" else set())
+    sort = sort if sort in sortable else "goods_count"
     direction = "ASC" if order == "asc" else "DESC"
-    sort_col = {"avg_price": "avg_price", "min_price": "min_price", "max_price": "max_price"}.get(
-        sort, f"s.{sort}")
-    total = query(f"""SELECT COUNT(*) AS c FROM (
-        SELECT s.token, (SELECT MIN(g.price) FROM wzyp_goods g WHERE g.shop_token=s.token) AS min_price,
+    sort_col = f"s.{sort}"
+    base = """(SELECT s.*,
+               (SELECT MIN(g.price) FROM wzyp_goods g WHERE g.shop_token=s.token) AS min_price,
                (SELECT MAX(g.price) FROM wzyp_goods g WHERE g.shop_token=s.token) AS max_price,
-               (SELECT ROUND(AVG(g.price),2) FROM wzyp_goods g WHERE g.shop_token=s.token) AS avg_price
-        FROM wzyp_shops s WHERE {where}) t""", args, one=True)["c"]
+               (SELECT ROUND(AVG(g.price),2) FROM wzyp_goods g WHERE g.shop_token=s.token) AS avg_price,
+               (SELECT COUNT(*) FROM wzyp_goods g WHERE g.shop_token=s.token) AS fetched_count
+               FROM wzyp_shops s) s"""
+    local_columns = ("s.auto_count, s.manual_count, s.unknown_count, s.sales_count_text, s.synced_at, "
+                     if active_source() == "16688" else "")
+    total = query(f"SELECT COUNT(*) AS c FROM {base} WHERE {where}", args, one=True)["c"]
     rows = query(f"""
         SELECT s.token, s.nickname, s.login_province, s.contact_qq, s.contact_wechat,
                s.sell_count, s.deposit_money, s.goods_count, s.card_count, s.article_count,
                s.resource_count, s.equity_count, s.auth_status, s.shop_newbie,
                DATE_FORMAT(s.create_time,'%%Y-%%m-%%d') AS create_time, s.link,
-               s.description, s.avatar,
-               (SELECT MIN(g.price) FROM wzyp_goods g WHERE g.shop_token=s.token) AS min_price,
-               (SELECT MAX(g.price) FROM wzyp_goods g WHERE g.shop_token=s.token) AS max_price,
-               (SELECT ROUND(AVG(g.price),2) FROM wzyp_goods g WHERE g.shop_token=s.token) AS avg_price,
-               (SELECT COUNT(*) FROM wzyp_goods g WHERE g.shop_token=s.token) AS fetched_count,
+               s.description, s.avatar, {local_columns}
+               s.min_price, s.max_price, s.avg_price, s.fetched_count,
                s.fetch_done
-        FROM wzyp_shops s WHERE {where}
+        FROM {base} WHERE {where}
         ORDER BY {sort_col} {direction}, s.token ASC
         LIMIT %s OFFSET %s""", args + [limit, offset])
     return {"total": total, "rows": rows}
@@ -223,10 +256,12 @@ def run_readonly_sql(sql, limit=200):
     sql = (sql or "").strip().rstrip(";")
     if not SAFE_SELECT.match(sql):
         return {"error": "仅允许 SELECT 查询"}
+    if ";" in sql or re.search(r"\b(?:SLEEP|BENCHMARK|GET_LOCK|RELEASE_LOCK|LOAD_FILE)\s*\(|\bFOR\s+UPDATE\b", sql, re.I):
+        return {"error": "仅允许单条只读查询，禁止锁定或副作用函数"}
     if re.search(r"\bINTO\s+(OUT|DUMP)FILE\b", sql, re.I):
         return {"error": "禁止文件导出"}
-    if not re.search(r"\bLIMIT\s+\d+\s*$", sql, re.I):
-        sql = f"SELECT * FROM ({sql}) AS _sub LIMIT {limit}"
+    limit = min(max(int(limit), 1), 200)
+    sql = f"SELECT * FROM ({sql}) AS _sub LIMIT {limit}"
     try:
         rows = query(sql)
         return {"rows": rows[:limit], "count": len(rows)}
@@ -234,8 +269,8 @@ def run_readonly_sql(sql, limit=200):
         err = str(e)
         # 表名/列名写错 → 附上正确 schema 让模型自我纠正
         hint = ""
-        if "doesn't exist" in err or "Unknown column" in err or "Unknown table" in err:
-            hint = ("\n【纠正提示】你引用了不存在的表或列。本库仅有 3 张表："
+        if any(text in err for text in ("doesn't exist", "Unknown column", "Unknown table", "no such table", "no such column")):
+            hint = ("\n【纠正提示】你引用了不存在的表或列。仅允许查询以下 3 张业务数据表："
                     "wzyp_shops(店铺)、wzyp_goods(商品)、wzyp_goods_detail(商品详情)。"
                     "请先调用 data_schema 核对正确表名列名后重写 SQL。")
         return {"error": f"SQL 错误: {err}{hint}"}
@@ -249,18 +284,30 @@ def schema_text():
         n3 = query("SELECT COUNT(*) AS c FROM wzyp_goods_detail", one=True)["c"]
     except Exception:
         n1, n2, n3 = "?", "?", "?"
-    return f"""## 数据库只有以下 3 张表（不存在其他表，禁止编造 products/shops/goods 等表名）
+    source_info = (
+        "当前数据源：16688.com.cn 的本地 SQLite 店铺快照。使用 SQLite SELECT 语法。\n"
+        "仅代表已同步店铺，并非平台全站数据。price 是未含手续费的商品标价；real_price/market_price 未公开，为 NULL。\n"
+        "商品类型 auto=自动发货、manual=手动发货、unknown=未公开；不要将它们当作链动小铺商品分类。\n"
+        "店铺 sell_count 是公开付款数量的下限，必须结合 sales_count_text 原文解释万+，不可称精确销量。\n"
+        "店铺附加字段：auto_count/manual_count/unknown_count、sales_count_text、synced_at。\n"
+        "商品和详情附加字段：sales_count_text、stock_quantity、stock_status、category_name、synced_at。\n"
+        "商品 link 格式 https://www.16688.com.cn/goods/<goods_key>；店铺 link 为平台真实店铺链接。\n"
+        if active_source() == "16688" else "当前数据源：链动小铺 wzyp.cn 的 MySQL 数据。\n")
+    example_type = "auto" if active_source() == "16688" else "equity"
+    example_type2 = "manual" if active_source() == "16688" else "resource"
+    example_type3 = "auto" if active_source() == "16688" else "card"
+    return source_info + f"""## 当前仅允许查询以下 3 张数据表（采集任务表不可访问，禁止编造 products/shops/goods 等表名）
 
 表：wzyp_shops（店铺，{n1}行）
 - token VARCHAR 主键(店铺标识) nickname 店名 login_province 注册省份
 - contact_qq / contact_wechat 联系方式 sell_count 销量 deposit_money 保证金
 - goods_count 商品总数 card_count/article_count/resource_count/equity_count 各类型商品数
 - auth_status 实名状态 shop_newbie 新手店 fetch_done 抓取完成 create_time 开店时间
-- link 店铺链接（https://wzyp.cn/shop/<token>） description 简介
+- link 真实店铺链接（直接读取，不要拼接域名） description 简介
 
 表：wzyp_goods（在售商品，{n2}行）
-- goods_key 唯一标识 shop_token→wzyp_shops.token goods_type∈(card卡密/article文章/resource资源/equity权益)
-- name 商品名 price 价格 market_price 市场价 status 状态 link 商品链接(https://wzyp.cn/item/<goods_key>)
+- goods_key 唯一标识 shop_token→wzyp_shops.token goods_type 商品类型（见当前数据源的类型说明）
+- name 商品名 price 价格 market_price 市场价 status 状态 link 真实商品链接
 
 表：wzyp_goods_detail（商品详情，{n3}行）
 - goods_key 主键(→wzyp_goods.goods_key) name price real_price image description(HTML全文)
@@ -270,7 +317,7 @@ wzyp_goods.shop_token = wzyp_shops.token
 wzyp_goods_detail.goods_key = wzyp_goods.goods_key
 
 ## 类型中英映射（goods_type 字段存英文）
-card=卡密 article=文章 resource=资源 equity=权益
+链动小铺：card=卡密 article=文章 resource=资源 equity=权益；16688：auto=自动发货 manual=手动发货 unknown=未公开
 
 ## 示例 SQL（照此模式写，禁止发明新表/新列）
 -- 店铺名称+链接列表：
@@ -278,10 +325,10 @@ SELECT nickname AS 店铺, link AS 链接 FROM wzyp_shops ORDER BY sell_count DE
 -- 某类型商品中哪些店铺价格低于 X：
 SELECT s.nickname AS 店铺, g.name AS 商品, g.price FROM wzyp_goods g
 JOIN wzyp_shops s ON s.token=g.shop_token
-WHERE g.goods_type='equity' AND g.price < 20 ORDER BY g.price LIMIT 50
+WHERE g.goods_type='{example_type}' AND g.price < 20 ORDER BY g.price LIMIT 50
 -- 某类型平均价与最高价：
-SELECT ROUND(AVG(g.price),2) AS 均价, MAX(g.price) AS 最高价 FROM wzyp_goods g WHERE g.goods_type='resource'
+SELECT ROUND(AVG(g.price),2) AS 均价, MAX(g.price) AS 最高价 FROM wzyp_goods g WHERE g.goods_type='{example_type2}'
 -- 某类型占比最高的店铺（按该店此类商品数排序）：
 SELECT s.nickname AS 店铺, COUNT(*) AS 该类商品数 FROM wzyp_goods g
 JOIN wzyp_shops s ON s.token=g.shop_token
-WHERE g.goods_type='card' GROUP BY s.token ORDER BY 该类商品数 DESC LIMIT 10"""
+WHERE g.goods_type='{example_type3}' GROUP BY s.token ORDER BY 该类商品数 DESC LIMIT 10"""

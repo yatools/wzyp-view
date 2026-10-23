@@ -1,18 +1,44 @@
 """wzyp-view 后端：FastAPI 静态 + API + SSE"""
 import json
 import os
+from contextlib import asynccontextmanager
+from typing import Literal
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-import agent
 import config as cfg
 import db
+import platform16688
+from crawler16688 import CrawlManager
+from crawl_store import JobConflict
 from config import BASE_DIR
 
-app = FastAPI(title="wzyp-view")
+Source = Literal["wzyp", "16688"]
+crawler = CrawlManager()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    crawler.recover_interrupted()
+    try:
+        yield
+    finally:
+        crawler.shutdown()
+
+
+def get_agent():
+    # 数据浏览与采集无需启动 LLM 依赖。
+    import agent
+    return agent
+
+
+def memory_id(thread_id, source):
+    return f"16688:{thread_id}" if source == "16688" else thread_id
+
+app = FastAPI(title="wzyp-view", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
 
@@ -26,9 +52,82 @@ def index():
 # ---------------- 数据 API ----------------
 
 @app.get("/api/stats")
-def api_stats():
-    return {"stats": db.shop_stats(), "type_dist": db.type_dist(),
-            "price_buckets": db.price_buckets(), "top_keywords": db.top_keywords(24)}
+def api_stats(source: Source = "wzyp"):
+    with db.use_source(source):
+        return {"source": source, "stats": db.shop_stats(), "type_dist": db.type_dist(),
+                "price_buckets": db.price_buckets(), "top_keywords": db.top_keywords(24)}
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/api/sources")
+def sources():
+    return {"sources": [{"id": "wzyp", "name": "链动小铺", "storage": "MySQL"},
+                        {"id": "16688", "name": "16688 交易平台", "storage": "SQLite"}],
+            "example_url": platform16688.EXAMPLE_URL}
+
+
+class SyncRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/sources/16688/sync")
+def sync_16688(body: SyncRequest):
+    try:
+        return platform16688.sync_shop(body.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except platform16688.PlatformError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+class CrawlRequest(BaseModel):
+    mode: Literal["discover", "refresh"] = "discover"
+    urls: list[str] = Field(default_factory=list, max_length=1000)
+
+
+@app.post("/api/sources/16688/crawl")
+def start_crawl(body: CrawlRequest):
+    try:
+        return crawler.start(body.mode, body.urls)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/sources/16688/crawl")
+def latest_crawl():
+    crawler.recover_interrupted()
+    return {"job": crawler.store.report()}
+
+
+@app.get("/api/sources/16688/crawl/{job_id}")
+def crawl_progress(job_id: str):
+    crawler.recover_interrupted()
+    report = crawler.store.report(job_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="采集任务不存在")
+    return report
+
+
+@app.post("/api/sources/16688/crawl/{job_id}/cancel")
+def cancel_crawl(job_id: str):
+    try:
+        return crawler.cancel(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="采集任务不存在") from exc
+
+
+@app.post("/api/sources/16688/crawl/{job_id}/resume")
+def resume_crawl(job_id: str):
+    try:
+        return crawler.resume(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="采集任务不存在") from exc
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 class FilterSpec(BaseModel):
@@ -43,19 +142,20 @@ class ShopsQuery(BaseModel):
     fetch_status: str | None = None   # done / fetching / empty
     sort: str = "goods_count"
     order: str = "desc"
-    page: int = 1
-    pageSize: int = 20
+    page: int = Field(default=1, ge=1)
+    pageSize: int = Field(default=20, ge=1, le=500)
 
 
 @app.post("/api/shops")
-def api_shops(q: ShopsQuery):
+def api_shops(q: ShopsQuery, source: Source = "wzyp"):
     d = q.model_dump()
     filters = d.pop("filters", None)
     fetch_status = d.pop("fetch_status", None)
     page = d.pop("page"); size = d.pop("pageSize")
     d.pop("sort"); d.pop("order")
-    return db.list_shops(kw=d.get("kw"), filters=filters, fetch_status=fetch_status,
-                         sort=q.sort, order=q.order, offset=(page - 1) * size, limit=size)
+    with db.use_source(source):
+        return db.list_shops(kw=d.get("kw"), filters=filters, fetch_status=fetch_status,
+                             sort=q.sort, order=q.order, offset=(page - 1) * size, limit=size)
 
 
 class GoodsQuery(BaseModel):
@@ -67,30 +167,32 @@ class GoodsQuery(BaseModel):
     filters: list[FilterSpec] | None = None
     sort: str = "price"
     order: str = "asc"
-    page: int = 1
-    pageSize: int = 20
+    page: int = Field(default=1, ge=1)
+    pageSize: int = Field(default=20, ge=1, le=500)
 
 
 @app.post("/api/goods")
-def api_goods(q: GoodsQuery):
+def api_goods(q: GoodsQuery, source: Source = "wzyp"):
     d = q.model_dump()
     filters = d.pop("filters", None)
     page = d.pop("page"); size = d.pop("pageSize")
     d.pop("sort"); d.pop("order")
-    return db.list_goods(**d, filters=filters, sort=q.sort, order=q.order,
-                         offset=(page - 1) * size, limit=size)
+    with db.use_source(source):
+        return db.list_goods(**d, filters=filters, sort=q.sort, order=q.order,
+                             offset=(page - 1) * size, limit=size)
 
 
 @app.get("/api/goods/{goods_key}")
-def api_goods_detail(goods_key: str):
-    return db.goods_detail(goods_key) or {}
+def api_goods_detail(goods_key: str, source: Source = "wzyp"):
+    with db.use_source(source):
+        return db.goods_detail(goods_key) or {}
 
 
 # ---------------- 设置 API（LLM + DB + 导入导出）----------------
 
 @app.get("/api/llm/settings")
 def get_settings():
-    s = agent.get_llm_settings()
+    s = cfg.get_llm_config()
     return {"baseurl": s["baseurl"], "model": s["model"],
             "apikey": (s.get("apikey") or "")[:8] + "..." if s.get("apikey") else "",
             "has_key": bool(s.get("apikey"))}
@@ -104,7 +206,7 @@ class LLMSettings(BaseModel):
 
 @app.post("/api/llm/settings")
 def save_settings(body: LLMSettings):
-    current = agent.get_llm_settings()
+    current = cfg.get_llm_config()
     cfg.save_settings(llm={
         "baseurl": body.baseurl or current["baseurl"],
         "model": body.model or current["model"],
@@ -116,7 +218,7 @@ def save_settings(body: LLMSettings):
 def test_llm():
     """LLM 连通性测试"""
     try:
-        llm = agent.build_llm()
+        llm = get_agent().build_llm()
         r = llm.invoke("回复:OK")
         return {"ok": True, "reply": str(r.content)[:50]}
     except Exception as e:
@@ -231,9 +333,9 @@ class ChatBody(BaseModel):
 
 
 @app.post("/api/chat")
-def chat(body: ChatBody):
+def chat(body: ChatBody, source: Source = "wzyp"):
     def gen():
-        for evt, payload in agent.run_agent_stream(body.thread_id, body.message):
+        for evt, payload in get_agent().run_agent_stream(memory_id(body.thread_id, source), body.message, source=source):
             data = json.dumps({"event": evt, "data": payload}, ensure_ascii=False)
             yield f"data: {data}\n\n"
         yield "data: [DONE]\n\n"
@@ -243,21 +345,21 @@ def chat(body: ChatBody):
 
 
 @app.get("/api/chat/history")
-def chat_history(thread_id: str = "default"):
-    return {"messages": agent.memory_store.load(thread_id)}
+def chat_history(thread_id: str = "default", source: Source = "wzyp"):
+    return {"messages": get_agent().memory_store.load(memory_id(thread_id, source))}
 
 
 @app.post("/api/chat/clear")
-def chat_clear(thread_id: str = "default"):
-    agent.memory_store.save(thread_id, [])
+def chat_clear(thread_id: str = "default", source: Source = "wzyp"):
+    get_agent().memory_store.save(memory_id(thread_id, source), [])
     return {"ok": True}
 
 
 @app.post("/api/chat/delete")
-def chat_delete(body: dict):
+def chat_delete(body: dict, source: Source = "wzyp"):
     """删除单个会话（记忆 + 会话本身）"""
     tid = (body or {}).get("thread_id", "")
     if not tid:
         return {"ok": False, "error": "thread_id required"}
-    deleted = agent.memory_store.delete(tid)
+    deleted = get_agent().memory_store.delete(memory_id(tid, source))
     return {"ok": True, "deleted": deleted}

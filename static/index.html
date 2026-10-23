@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>wzyp 店铺数据洞察</title>
+<title>店铺数据洞察 · 链动小铺 / 16688</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <style>
 :root{
@@ -13,6 +13,7 @@
   --shadow:0 8px 24px rgba(31,41,55,.08); --radius:14px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
+[hidden]{display:none!important}
 body{font-family:"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--txt);height:100vh;display:flex;flex-direction:column;overflow:hidden}
 /* ---------- 顶栏 ---------- */
 header{display:flex;align-items:center;gap:16px;padding:0 20px;height:56px;background:rgba(255,255,255,.75);backdrop-filter:blur(12px);border-bottom:1px solid var(--line);z-index:10}
@@ -199,6 +200,21 @@ th.num{text-align:right}
 .test-result.ok{display:block;background:var(--ok-weak);color:var(--ok)}
 .test-result.bad{display:block;background:#fef2f2;color:#dc2626}
 .hint{font-size:12px;color:var(--sub);margin-top:4px}
+.source-select{border:1px solid var(--line);border-radius:8px;padding:7px;background:#fff;color:var(--txt);max-width:155px}
+.source-panel{padding:14px 20px;background:#fff;border-bottom:1px solid var(--line);max-height:44vh;overflow:auto;flex-shrink:0}
+.source-panel .sync-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.source-panel input{flex:1;min-width:200px;border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-size:13px}
+.source-panel .hint{line-height:1.7}
+.source-panel details{margin-top:8px;font-size:12px;color:var(--sub)}
+.source-panel summary{cursor:pointer;width:max-content}
+.source-panel textarea{width:100%;resize:vertical;min-height:60px;max-height:150px;margin:8px 0;border:1px solid var(--line);border-radius:8px;padding:9px;font-family:inherit;font-size:12px;line-height:1.5}
+.crawl-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:10px 0}
+.crawl-metrics div{background:var(--bg);padding:7px 10px;border-radius:8px;font-size:11px;color:var(--sub)}
+.crawl-metrics b{display:block;font-size:19px;color:var(--txt);margin-top:2px;font-variant-numeric:tabular-nums}
+.crawl-status{font-size:12px;color:var(--brand);line-height:1.7;margin-top:7px}
+.crawl-failures{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--warn);font-size:12px;max-height:110px;overflow:auto}
+.btn:disabled{opacity:.55;cursor:wait}
+.desc-frame{width:100%;height:350px;border:0;background:#fff;border-radius:10px}
 #toast{position:fixed;top:70px;right:20px;background:#111827;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;z-index:99;opacity:0;transition:.3s;pointer-events:none}
 #toast.show{opacity:.95}
 @media(max-width:900px){.chart-row{grid-template-columns:1fr}.chat-side{display:none}.chat-scroll,.chat-input-bar{padding-left:12px;padding-right:12px}}
@@ -206,7 +222,7 @@ th.num{text-align:right}
 </head>
 <body>
 <header>
-  <div class="logo"><span class="dot"></span>wzyp 店铺数据洞察</div>
+  <div class="logo"><span class="dot"></span>店铺数据洞察</div>
   <nav>
     <button data-page="dashboard" class="active">📊 总览</button>
     <button data-page="shops">🏪 店铺</button>
@@ -215,9 +231,36 @@ th.num{text-align:right}
     <button data-page="settings">⚙️ 设置</button>
   </nav>
   <div class="spacer"></div>
+  <select class="source-select" id="dataSource" aria-label="数据源" onchange="switchSource(this.value)">
+    <option value="16688">16688 交易平台</option>
+    <option value="wzyp">链动小铺</option>
+  </select>
   <div class="llm-badge off" id="llmBadge">LLM 未连接</div>
 </header>
 
+<div class="source-panel" id="sourcePanel">
+  <div class="sync-row">
+    <b style="font-size:14px;margin-right:auto">16688 平台公开商品采集</b>
+    <button class="btn btn-primary" id="discoverButton" onclick="startCrawl('discover')">发现并采集公开商品</button>
+    <button class="btn btn-ghost" id="refreshButton" onclick="startCrawl('refresh')">刷新已收录店铺</button>
+    <button class="btn btn-ghost" id="cancelCrawlButton" onclick="changeCrawl('cancel')" hidden>取消采集</button>
+    <button class="btn btn-primary" id="resumeCrawlButton" onclick="changeCrawl('resume')" hidden>继续采集</button>
+  </div>
+  <div class="hint">已发现公开店铺的商品快照 · 从公开索引和商品链接发现多家店铺，再向 16688 原站采集。覆盖范围不代表全站完整数据。标价未含手续费，“万+付款”为公开销量下限。</div>
+  <div class="crawl-status" id="crawlStatus" role="status" aria-live="polite">尚未开始平台采集。已有店铺快照仍可查询。</div>
+  <div id="crawlProgress" hidden>
+    <div class="crawl-metrics" id="crawlMetrics"></div>
+    <details id="crawlErrorBox" hidden><summary>查看失败记录</summary><div class="crawl-failures" id="crawlFailures"></div></details>
+  </div>
+  <details><summary>补充链接 / 单店同步</summary>
+    <textarea id="crawlUrls" aria-label="补充采集链接" placeholder="可选：每行一个 16688 店铺或商品链接，加入下一次平台采集任务"></textarea>
+    <div class="sync-row">
+      <input id="syncUrl" aria-label="16688 商品或店铺链接" placeholder="输入明确的商品或店铺链接，可单独同步整店">
+      <button class="btn btn-ghost" id="syncButton" onclick="sync16688()">同步单个店铺</button>
+    </div>
+    <div class="hint" id="syncStatus" role="status" aria-live="polite"></div>
+  </details>
+</div>
 <main>
   <!-- ============ 总览 ============ -->
   <section class="page active" id="page-dashboard">
@@ -227,7 +270,7 @@ th.num{text-align:right}
       <div class="card"><h3>价格区间分布</h3><div id="priceChart"></div></div>
     </div>
     <div class="card"><h3>商品热词 Top</h3><div class="wordcloud" id="wordCloud"></div></div>
-    <div class="card"><h3>店铺销量 Top10</h3><div id="sellChart"></div></div>
+    <div class="card"><h3 id="salesChartTitle">店铺销量 Top10</h3><div id="sellChart"></div></div>
   </section>
 
   <!-- ============ 店铺 ============ -->
@@ -385,7 +428,8 @@ th.num{text-align:right}
       </div>
 
       <div class="card">
-        <h3>🗄️ 数据库配置（MySQL）</h3>
+        <h3>🗄️ 链动小铺数据库配置（MySQL）</h3>
+        <div class="hint" style="margin-bottom:12px">此配置用于链动小铺。16688 数据自动保存在 data/16688.sqlite3，无需配置数据库。</div>
         <div class="form-row">
           <label>主机地址</label>
           <input id="setDbHost" placeholder="127.0.0.1">
@@ -466,10 +510,127 @@ const $$ = s => document.querySelectorAll(s);
 const fmt = n => n==null?'-':Number(n).toLocaleString('zh-CN');
 const money = n => n==null?'-':'¥'+Number(n).toFixed(2);
 function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
+let dataSource=localStorage.getItem('wzyp_source')||'16688';
+let crawlJob=null,crawlTimer=null,crawlPolling=false,crawlActionBusy=false,singleSyncBusy=false;
+let crawlLastRefresh=0,crawlLastSnapshot='';
+if(!['wzyp','16688'].includes(dataSource)) dataSource='16688';
+function sourceURL(path){const url=new URL(path,location.origin);url.searchParams.set('source',dataSource);return url.pathname+url.search}
 async function api(path,body){
-  const r = await fetch(path, body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});
-  if(!r.ok) throw new Error(r.status);
+  const r = await fetch(sourceURL(path), body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});
+  if(!r.ok){let message=dataSource==='wzyp'&&r.status===500?'链动小铺数据库不可用，请在设置中配置 MySQL':'请求失败（'+r.status+'）';try{const d=await r.json();if(typeof d.detail==='string')message=d.detail}catch(e){}throw new Error(message)}
   return r.json();
+}
+window.addEventListener('unhandledrejection',e=>{toast(e.reason?.message||'请求失败，请检查连接');e.preventDefault()});
+function applySourceUI(){
+  const local=dataSource==='16688';
+  $('#dataSource').value=dataSource;
+  $('#sourcePanel').hidden=!local;
+  $('#salesChartTitle').textContent=local?'店铺公开销量下限 Top10':'店铺销量 Top10';
+  $('#gType').innerHTML='<option value="">全部类型</option>'+(local?
+    '<option value="auto">自动发货</option><option value="manual">手动发货</option><option value="unknown">未公开</option>':
+    '<option value="card">卡密</option><option value="article">文章</option><option value="resource">资源</option><option value="equity">权益</option>');
+  const typeCols=local?[['auto_count','自动'],['manual_count','手动'],['unknown_count','未公开']]:[['card_count','卡密'],['equity_count','权益'],['resource_count','资源']];
+  $$('#shopHead th').forEach((th,i)=>{if(i>=3&&i<=5){th.dataset.sort=typeCols[i-3][0];th.textContent=typeCols[i-3][1]}});
+  $('#shopHead th[data-sort="sell_count"]').textContent=local?'公开付款数':'销量';
+  $('#shopSort').innerHTML=(local?SHOP_SORT_OPTIONS.filter(([v])=>!['card_count','equity_count'].includes(v)).concat([['auto_count','按自动发货数'],['manual_count','按手动发货数']]):SHOP_SORT_OPTIONS).map(([v,l])=>`<option value="${v}">${l}</option>`).join('');
+  $('#shopSort').value=shopQ.sort;
+  clearTimeout(crawlTimer);
+  if(local) scheduleCrawlPoll(0);
+}
+async function switchSource(value){
+  if(sending){$('#dataSource').value=dataSource;toast('请等待当前 AI 回复完成后切换数据源');return}
+  dataSource=value;localStorage.setItem('wzyp_source',value);
+  shopLoaded=false;goodsLoaded=false;chatInited=false;
+  threadId='t-'+Date.now().toString(36);threads=[];
+  shopQ.sort='goods_count';shopQ.order='desc';goodsQ.sort='price';goodsQ.order='asc';
+  ['shopKw','gKw','gMin','gMax'].forEach(id=>$('#'+id).value='');
+  $('#shopFetch').value='';$('#gShop').innerHTML='<option value="">全部店铺</option>';$('#gExcludeZero').checked=false;
+  $$('.fbuilder .frow').forEach(row=>row.remove());
+  $$('.fbuilder').forEach(box=>{box.classList.remove('open');delete box.dataset.rows});
+  $('#shopOrder').value='desc';$('#gOrder').value='asc';$('#gSort').value='price';
+  closeDrawer();closeConfirm();applySourceUI();
+  renderMessages([]);$('#threadList').innerHTML='';window._drillMap=[];
+  $('#statGrid').innerHTML='';['typeChart','priceChart','wordCloud','sellChart'].forEach(id=>$('#'+id).innerHTML='');
+  $('#shopTable tbody').innerHTML='';$('#goodsTable tbody').innerHTML='';
+  updateHeadMarks('#shopHead',shopQ);updateHeadMarks('#goodsHead',goodsQ);
+  await loadDashboard();
+  if($('#page-shops').classList.contains('active')) await loadShops(1);
+  if($('#page-goods').classList.contains('active')) await initGoodsPage();
+  if($('#page-chat').classList.contains('active')) initChat();
+}
+async function sync16688(){
+  const button=$('#syncButton'), status=$('#syncStatus');
+  if(button.disabled)return;
+  singleSyncBusy=true;button.disabled=true;button.textContent='正在同步…';status.textContent='正在识别店铺并读取公开商品，请稍候…';
+  try{
+    const result=await api('/api/sources/16688/sync',{url:$('#syncUrl').value.trim()});
+    status.textContent=`已同步「${result.shop.nickname}」：${result.goods_count} 件商品、${result.detail_count} 条详情 · ${new Date(result.synced_at).toLocaleString('zh-CN')}`;
+    await switchSource('16688');toast('店铺数据已更新');
+  }catch(e){status.textContent='同步失败：'+e.message;toast(e.message)}
+  finally{singleSyncBusy=false;button.textContent='同步单个店铺';renderCrawl(crawlJob)}
+}
+function crawlActive(){return crawlJob&&['running','cancelling'].includes(crawlJob.status)}
+function renderCrawl(job){
+  crawlJob=job;
+  const active=crawlActive(), busy=active||crawlActionBusy;
+  $('#discoverButton').disabled=busy||singleSyncBusy;
+  $('#refreshButton').disabled=busy||singleSyncBusy;
+  $('#syncButton').disabled=busy||singleSyncBusy;
+  $('#cancelCrawlButton').hidden=!active;
+  $('#cancelCrawlButton').disabled=crawlActionBusy||job?.status==='cancelling';
+  $('#resumeCrawlButton').hidden=!job||!['partial','failed','cancelled','interrupted'].includes(job.status);
+  $('#resumeCrawlButton').disabled=busy;
+  $('#crawlProgress').hidden=!job;
+  if(!job)return;
+  const statuses={running:'采集中',cancelling:'正在取消，等待当前请求退出',cancelled:'已取消，可继续',interrupted:'已中断，可继续',completed:'本次采集完成',partial:'部分完成，可重试失败项',failed:'采集失败，可重试'};
+  const phases={discovering:'发现公开入口',collecting:'逐店采集',finished:'已结束',interrupted:'已中断'};
+  $('#crawlStatus').textContent=`${statuses[job.status]||job.status} · ${phases[job.phase]||job.phase}${job.phase==='discovering'?' · 已读取 '+job.discovery_pages+' 页索引':''} · 最近更新 ${new Date(job.updated_at).toLocaleString('zh-CN')}`;
+  const metrics=[['发现链接',job.discovered_links],['核验店铺',job.resolved_shops],['成功店铺',job.success_shops],['失败店铺 / 入口',job.failure_count],['本次商品数',job.collected_goods],['待处理链接',job.pending_links]];
+  $('#crawlMetrics').innerHTML=metrics.map(([label,value])=>`<div>${label}<b>${fmt(value)}</b></div>`).join('');
+  const failures=[job.discovery_error,job.error,...job.failures.map(f=>`${f.url}：${f.error}`)].filter(Boolean);
+  $('#crawlErrorBox').hidden=!failures.length;
+  $('#crawlFailures').textContent=failures.join('\n');
+}
+function scheduleCrawlPoll(delay=2000){clearTimeout(crawlTimer);if(dataSource==='16688')crawlTimer=setTimeout(pollCrawl,delay)}
+async function refreshCrawlViews(){
+  if(dataSource!=='16688')return;
+  shopLoaded=false;goodsLoaded=false;
+  await loadDashboard();
+  if($('#page-shops').classList.contains('active'))await loadShops(shopPage);
+  if($('#page-goods').classList.contains('active'))await initGoodsPage(goodsPage);
+}
+async function pollCrawl(){
+  if(crawlPolling){scheduleCrawlPoll();return}
+  crawlPolling=true;
+  try{
+    const {job}=await api('/api/sources/16688/crawl');
+    if(dataSource!=='16688')return;
+    renderCrawl(job);
+    if(job){
+      const snapshot=job.job_id+':'+job.success_shops;
+      if(snapshot!==crawlLastSnapshot&&job.success_shops>0&&(!crawlActive()||Date.now()-crawlLastRefresh>10000)){
+        crawlLastSnapshot=snapshot;crawlLastRefresh=Date.now();await refreshCrawlViews();
+      }
+    }
+  }catch(e){if(dataSource==='16688')$('#crawlStatus').textContent='暂时无法读取进度：'+e.message}
+  finally{crawlPolling=false;scheduleCrawlPoll()}
+}
+async function startCrawl(mode){
+  if(crawlActionBusy)return;
+  crawlActionBusy=true;renderCrawl(crawlJob);
+  try{
+    const urls=$('#crawlUrls').value.split(/\r?\n/).map(v=>v.trim()).filter(Boolean);
+    renderCrawl(await api('/api/sources/16688/crawl',{mode,urls}));
+    toast(crawlJob.reused?'已有任务正在采集，已显示当前进度':'已启动平台采集');scheduleCrawlPoll(0);
+  }catch(e){toast(e.message)}
+  finally{crawlActionBusy=false;renderCrawl(crawlJob)}
+}
+async function changeCrawl(action){
+  if(!crawlJob||crawlActionBusy)return;
+  crawlActionBusy=true;renderCrawl(crawlJob);
+  try{renderCrawl(await api(`/api/sources/16688/crawl/${encodeURIComponent(crawlJob.job_id)}/${action}`,{}));scheduleCrawlPoll(0)}
+  catch(e){toast(e.message)}
+  finally{crawlActionBusy=false;renderCrawl(crawlJob)}
 }
 function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 /* markdown 渲染（marked + XSS 转义） */
@@ -493,14 +654,16 @@ $$('nav button').forEach(b=>b.onclick=()=>{
 
 /* ================= 总览（全部可点击下钻） ================= */
 async function loadDashboard(){
+  const requestedSource=dataSource;
   const d = await api('/api/stats');
+  if(requestedSource!==dataSource)return;
   const s=d.stats;
   /* 卡片: [label, value, drill] drill=null 表示不可下钻 */
   const cards = [
     ['店铺数', fmt(s.shop_count), {page:'shops'}],
     ['在售商品', fmt(s.goods_count), {page:'goods'}],
     ['商品详情', fmt(s.detail_count), {page:'goods',filters:[{field:'status',op:'eq',value:1}]}],
-    ['总销量', fmt(s.total_sell), {page:'shops',sort:'sell_count',order:'desc'}],
+    [dataSource==='16688'?'公开销量下限':'总销量', fmt(s.total_sell), {page:'shops',sort:'sell_count',order:'desc'}],
     ['总保证金', '¥'+fmt(s.total_deposit), {page:'shops',sort:'deposit_money',order:'desc'}],
     ['商品均价', money(s.avg_price), {page:'goods',filters:[{field:'price',op:'gte',value:0}],sort:'price',order:'desc'}],
     ['最低价', money(s.min_price), {page:'goods',filters:[{field:'price',op:'eq',value:s.min_price}]}],
@@ -513,7 +676,7 @@ async function loadDashboard(){
 
   /* 类型分布 → 点某类型跳商品页按该类型筛选 */
   barChart('#typeChart', d.type_dist.map(t=>[typeZh(t.goods_type),t.count]), (label)=>{
-    const en = {'卡密':'card','文章':'article','资源':'resource','权益':'equity'}[label];
+    const en = {'卡密':'card','文章':'article','资源':'resource','权益':'equity','自动发货':'auto','手动发货':'manual','未公开':'unknown'}[label];
     if(en) drillTo({page:'goods', gType:en, sort:'price', order:'asc'});
   });
   /* 价格区间 → 点某区间跳商品页价格筛选 */
@@ -534,6 +697,7 @@ async function loadDashboard(){
   }).join('');
   /* 销量Top10 → 点某店跳该店商品 */
   const shops=await api('/api/shops',{sort:'sell_count',order:'desc',page:1,pageSize:10});
+  if(requestedSource!==dataSource)return;
   barChart('#sellChart', shops.rows.map(r=>[r.nickname.slice(0,10),r.sell_count]), (label)=>{
     const shop = shops.rows.find(r=>r.nickname.slice(0,10)===label);
     if(shop) drillTo({page:'goods', gShop:shop.token});
@@ -599,7 +763,7 @@ function applyFiltersToBuilder(kind,filters){
   $(box).classList.add('open'); $(box).dataset.rows=1;
 }
 
-function typeZh(t){return{card:'卡密',article:'文章',resource:'资源',equity:'权益'}[t]||t}
+function typeZh(t){return{card:'卡密',article:'文章',resource:'资源',equity:'权益',auto:'自动发货',manual:'手动发货',unknown:'未公开'}[t]||t}
 function barChart(sel,rows,onLabel){
   const max=Math.max(...rows.map(r=>r[1]),1);
   $(sel).innerHTML=rows.map(([l,v],i)=>{
@@ -637,7 +801,8 @@ function toggleBuilder(kind){
   }
 }
 function addFilterRow(kind){
-  const fields = kind==='shop'?SHOP_FIELDS:GOODS_FIELDS;
+  const fields = kind==='shop'?(dataSource==='16688'?
+    SHOP_FIELDS.filter(([field])=>!['card_count','article_count','resource_count','equity_count','shop_newbie','create_time'].includes(field)).concat([['auto_count','自动发货数'],['manual_count','手动发货数'],['unknown_count','未公开类型数']]):SHOP_FIELDS):GOODS_FIELDS;
   const id = kind==='shop'?'#fbShopRows':'#fbGoodsRows';
   const div=document.createElement('div');
   div.className='frow';
@@ -703,16 +868,18 @@ $('#gSort').onchange=()=>{goodsQ.sort=$('#gSort').value;updateHeadMarks('#goodsH
 $('#gOrder').onchange=()=>{goodsQ.order=$('#gOrder').value;updateHeadMarks('#goodsHead',goodsQ);loadGoods(1)};
 
 /* ================= 店铺 ================= */
-let shopLoaded=false, shopPage=1;
+let shopLoaded=false, shopPage=1, shopPageSize=20;
 const shopQ={sort:'goods_count',order:'desc'};
 bindHeadSort('#shopHead','#shopSort','#shopOrder',loadShops,shopQ);
 async function loadShops(page=1){
+  const requestedSource=dataSource;
   shopPage=page;
   const q={kw:$('#shopKw').value.trim()||null,
     fetch_status:$('#shopFetch').value||null,
     filters:collectFilters('shop'),
-    sort:shopQ.sort,order:shopQ.order,page,pageSize:20};
+    sort:shopQ.sort,order:shopQ.order,page,pageSize:shopPageSize};
   const d=await api('/api/shops',q);
+  if(requestedSource!==dataSource)return;
   $('#shopTable tbody').innerHTML=d.rows.map(r=>{
     const fc=r.fetched_count||0;
     let st;
@@ -724,17 +891,17 @@ async function loadShops(page=1){
     <td><a class="shop-link" onclick="gotoShop('${esc(r.token)}')">${esc(r.nickname)}</a><div style="font-size:11px;color:var(--sub)">${esc(r.token)}</div></td>
     <td>${esc(r.login_province)||'-'}</td>
     <td class="num"><b>${fmt(r.goods_count)}</b><div class="fetch-hint">已入库 ${fmt(fc)}</div></td>
-    <td class="num">${fmt(r.card_count)}</td>
-    <td class="num">${fmt(r.equity_count)}</td>
-    <td class="num">${fmt(r.resource_count)}</td>
-    <td class="num">${fmt(r.sell_count)}</td>
+    <td class="num">${fmt(dataSource==='16688'?r.auto_count:r.card_count)}</td>
+    <td class="num">${fmt(dataSource==='16688'?r.manual_count:r.equity_count)}</td>
+    <td class="num">${fmt(dataSource==='16688'?r.unknown_count:r.resource_count)}</td>
+    <td class="num">${dataSource==='16688'?esc(r.sales_count_text)||'未公开':fmt(r.sell_count)}</td>
     <td class="num">${money(r.avg_price)}</td>
     <td class="num" style="font-size:12px">${money(r.min_price)} ~ ${money(r.max_price)}</td>
     <td>${r.create_time||'-'}</td>
     <td style="font-size:12px">${st}</td>
     <td style="font-size:12px">${esc(r.contact_qq)||'-'}</td>
   </tr>`}).join('')||'<tr><td colspan="12" style="text-align:center;color:var(--sub);padding:30px">无数据</td></tr>';
-  pager('#shopPager',page,Math.ceil(d.total/20),20,d.total,loadShops);
+  pager('#shopPager',page,Math.ceil(d.total/shopPageSize),shopPageSize,d.total,loadShops);
   shopLoaded=true;
 }
 function gotoShop(token){
@@ -746,18 +913,27 @@ function gotoShop(token){
 }
 
 /* ================= 商品 ================= */
-let goodsLoaded=false, goodsPage=1;
+let goodsLoaded=false, goodsPage=1, goodsPageSize=20;
 const goodsQ={sort:'price',order:'asc'};
 bindHeadSort('#goodsHead','#gSort','#gOrder',loadGoods,goodsQ);
-async function initGoodsPage(){
+async function initGoodsPage(page=1){
+  const requestedSource=dataSource;
   if(!goodsLoaded){
-    const shops=await api('/api/shops',{page:1,pageSize:300,sort:'nickname',order:'asc'});
-    $('#gShop').innerHTML='<option value="">全部店铺</option>'+shops.rows.map(r=>`<option value="${esc(r.token)}">${esc(r.nickname)}</option>`).join('');
+    const selected=$('#gShop').value, rows=[];
+    for(let page=1;;page++){
+      const shops=await api('/api/shops',{page,pageSize:500,sort:'nickname',order:'asc'});
+      if(requestedSource!==dataSource)return;
+      rows.push(...shops.rows);
+      if(rows.length>=shops.total||!shops.rows.length)break;
+    }
+    $('#gShop').innerHTML='<option value="">全部店铺</option>'+rows.map(r=>`<option value="${esc(r.token)}">${esc(r.nickname)}</option>`).join('');
+    if(rows.some(r=>r.token===selected))$('#gShop').value=selected;
   }
   goodsLoaded=true;
-  await loadGoods(1);
+  await loadGoods(page);
 }
 async function loadGoods(page=1){
+  const requestedSource=dataSource;
   goodsPage=page;
   const fs=collectFilters('goods')||[];
   if($('#gExcludeZero').checked) fs.push({field:'price',op:'gt',value:0});
@@ -765,50 +941,63 @@ async function loadGoods(page=1){
     kw:$('#gKw').value.trim()||null,
     price_min:$('#gMin').value||null,price_max:$('#gMax').value||null,
     filters:fs.length?fs:null,
-    sort:goodsQ.sort,order:goodsQ.order,page,pageSize:20};
+    sort:goodsQ.sort,order:goodsQ.order,page,pageSize:goodsPageSize};
   const d=await api('/api/goods',q);
+  if(requestedSource!==dataSource)return;
   $('#goodsTable tbody').innerHTML=d.rows.map(r=>`<tr>
     <td style="max-width:340px"><a class="shop-link" onclick="openDetail('${esc(r.goods_key)}')">${esc(r.name)}</a></td>
     <td style="font-size:12px">${esc(r.shop_name)||''}</td>
-    <td><span class="chip ${r.goods_type}">${typeZh(r.goods_type)}</span></td>
+    <td><span class="chip ${esc(r.goods_type)}">${esc(typeZh(r.goods_type))}</span></td>
     <td class="num"><b>${money(r.price)}</b></td>
     <td class="num" style="color:var(--sub)">${r.market_price?money(r.market_price):'-'}</td>
     <td>${r.status==1?'<span style="color:var(--ok)">在售</span>':'<span style="color:var(--warn)">下架</span>'}</td>
     <td><a class="shop-link" style="font-size:12px" href="${esc(r.link)}" target="_blank">原站↗</a></td>
   </tr>`).join('')||'<tr><td colspan="7" style="text-align:center;color:var(--sub);padding:30px">无数据</td></tr>';
-  pager('#goodsPager',page,Math.ceil(d.total/20),20,d.total,loadGoods);
+  pager('#goodsPager',page,Math.ceil(d.total/goodsPageSize),goodsPageSize,d.total,loadGoods);
 }
 function resetGoods(){['gKw','gMin','gMax'].forEach(i=>$('#'+i).value='');$('#gType').value='';$('#gShop').value='';$('#gExcludeZero').checked=false;$$('#fbGoodsRows .frow').forEach(r=>r.remove());loadGoods(1)}
 async function openDetail(key){
+  const requestedSource=dataSource;
   const d=await api('/api/goods/'+key);
+  if(requestedSource!==dataSource)return;
   $('#drawerTitle').textContent=(d.name||'商品详情').slice(0,40);
   $('#drawerBody').innerHTML=`
     ${d.image?`<img class="cover" src="${esc(d.image)}" onerror="this.remove()">`:''}
     <div class="kv">
-      <span class="k">价格</span><span><b>${money(d.price)}</b>（真实价 ${money(d.real_price)}）</span>
+      <span class="k">${dataSource==='16688'?'商品标价':'价格'}</span><span><b>${money(d.price)}</b> ${dataSource==='16688'?'（未含手续费）':'（真实价 '+money(d.real_price)+'）'}</span>
       <span class="k">市场价</span><span>${money(d.market_price)}</span>
-      <span class="k">类型</span><span>${typeZh(d.goods_type||'')}</span>
+      <span class="k">类型</span><span>${esc(typeZh(d.goods_type||''))}</span>
       <span class="k">goods_key</span><span>${esc(d.goods_key)}</span>
+      ${dataSource==='16688'?`<span class="k">平台分类</span><span>${esc(d.category_name)||'未公开'}</span>
+      <span class="k">公开付款数</span><span>${esc(d.sales_count_text)||'未公开'}</span>
+      <span class="k">可用库存</span><span>${fmt(d.stock_quantity)}</span>
+      <span class="k">同步时间</span><span>${esc(d.synced_at)}</span>
+      <span class="k">原站</span><span><a class="shop-link" href="${esc(d.link)}" target="_blank" rel="noopener noreferrer">查看商品 ↗</a></span>`:''}
     </div>
-    <div class="desc">${d.description||'无描述'}</div>`;
+    <iframe class="desc-frame" id="descriptionFrame" title="商品描述" sandbox="" referrerpolicy="no-referrer"></iframe>`;
+  $('#descriptionFrame').srcdoc='<meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src https: data:; style-src \'unsafe-inline\'; base-uri \'none\'; form-action \'none\'"><style>body{font:14px/1.7 sans-serif;overflow-wrap:anywhere}img{max-width:100%;height:auto}</style>'+(d.description||'无描述');
   $('#drawer').classList.add('open');$('#drawerMask').classList.add('open');
 }
 function closeDrawer(){$('#drawer').classList.remove('open');$('#drawerMask').classList.remove('open')}
 function pager(sel,page,totalPages,size,total,fn){
   $(sel).innerHTML=`<span>共 ${fmt(total)} 条 · 第 ${page}/${Math.max(totalPages,1)} 页 ·
-    <select onchange="PAGE_SIZE_SET(this.value)"><option value="20"${size==20?' selected':''}>20/页</option><option value="50"${size==50?' selected':''}>50/页</option><option value="100"${size==100?' selected':''}>100/页</option></select></span>
+    <select><option value="20"${size==20?' selected':''}>20/页</option><option value="50"${size==50?' selected':''}>50/页</option><option value="100"${size==100?' selected':''}>100/页</option></select></span>
     <button ${page<=1?'disabled':''}>‹ 上一页</button>
     <button ${page>=totalPages?'disabled':''}>下一页 ›</button>`;
   const btns=$(sel).querySelectorAll('button');
   btns[0].onclick=()=>fn(page-1);btns[1].onclick=()=>fn(page+1);
+  $(sel).querySelector('select').onchange=e=>{
+    if(sel==='#shopPager')shopPageSize=Number(e.target.value);else goodsPageSize=Number(e.target.value);
+    fn(1);
+  };
 }
 
 /* ================= 聊天 ================= */
 let chatInited=false, threadId='t-'+Date.now().toString(36), threads=[], sending=false;
-const THREADS_KEY='wzyp_threads';
+function threadsKey(){return dataSource==='wzyp'?'wzyp_threads':'wzyp_threads_16688'}
 function initChat(){
-  threads=JSON.parse(localStorage.getItem(THREADS_KEY)||'[]');
-  if(!threads.length){threads=[{id:threadId,title:'新对话'}];localStorage.setItem(THREADS_KEY,JSON.stringify(threads))}
+  threads=JSON.parse(localStorage.getItem(threadsKey())||'[]');
+  if(!threads.length){threads=[{id:threadId,title:'新对话'}];localStorage.setItem(threadsKey(),JSON.stringify(threads))}
   threadId=threads[0].id;
   renderThreads();
   loadHistory();
@@ -823,7 +1012,7 @@ function newThread(){
   threadId='t-'+Date.now().toString(36);
   threads.unshift({id:threadId,title:'新对话'});
   threads=threads.slice(0,20);
-  localStorage.setItem(THREADS_KEY,JSON.stringify(threads));
+  localStorage.setItem(threadsKey(),JSON.stringify(threads));
   renderThreads();renderMessages([]);
 }
 /* ---- 删除会话（带确认弹窗） ---- */
@@ -846,11 +1035,11 @@ async function doDeleteThread(id){
     await api('/api/chat/delete',{thread_id:id});
   }catch(e){/* 后端失败也继续本地删除 */}
   threads=threads.filter(t=>t.id!==id);
-  localStorage.setItem(THREADS_KEY,JSON.stringify(threads));
+  localStorage.setItem(threadsKey(),JSON.stringify(threads));
   if(threads.length===0){
     threadId='t-'+Date.now().toString(36);
     threads=[{id:threadId,title:'新对话'}];
-    localStorage.setItem(THREADS_KEY,JSON.stringify(threads));
+    localStorage.setItem(threadsKey(),JSON.stringify(threads));
     renderThreads();renderMessages([]);
   }else if(id===threadId){
     threadId=threads[0].id;
@@ -896,7 +1085,7 @@ async function sendChat(){
   bubble.innerHTML='<span class="typing"><i></i><i></i><i></i></span>';
   let acc='';
   try{
-    const resp=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    const resp=await fetch(sourceURL('/api/chat'),{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({thread_id:threadId,message:text})});
     const reader=resp.body.getReader();const dec=new TextDecoder();
     let buf='';
@@ -922,7 +1111,7 @@ async function sendChat(){
   }catch(e){bubble.innerHTML=`<div class="md">${mdRender('⚠️ 网络错误: '+e.message)}</div>`}
   if(!acc)bubble.innerHTML='<div class="md">（无回复，请检查 LLM 设置）</div>';
   const t=threads.find(x=>x.id===threadId);
-  if(t&&t.title==='新对话'){t.title=text.slice(0,16);localStorage.setItem(THREADS_KEY,JSON.stringify(threads));renderThreads()}
+  if(t&&t.title==='新对话'){t.title=text.slice(0,16);localStorage.setItem(threadsKey(),JSON.stringify(threads));renderThreads()}
   sending=false;$('#sendBtn').disabled=false;$('#chatInput').focus();
 }
 function buildFollowupsEl(fs){
@@ -1066,7 +1255,7 @@ $('#chatInput').addEventListener('input',function(){
   this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px';
 });
 ['shopKw','gKw'].forEach(id=>$('#'+id).addEventListener('keydown',e=>{if(e.key==='Enter')$('#'+(id==='shopKw'?'shopKw':'gKw'))&& (id==='shopKw'?loadShops(1):loadGoods(1))}));
-loadDashboard();loadSettings();refreshLlmBadge();
+applySourceUI();loadDashboard();loadSettings();refreshLlmBadge();
 </script>
 </body>
 </html>

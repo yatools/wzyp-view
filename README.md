@@ -1,6 +1,6 @@
-# wzyp-view — 链动小铺店铺数据洞察
+# wzyp-view — 链动小铺 / 16688 商品数据洞察
 
-[wzyp.cn（链动小铺寄售平台）](https://wzyp.cn) 全站 **250 家店铺 / 11,042 件在售商品** 的数据可视化与 LangGraph AI 分析工具。
+支持 [链动小铺](https://wzyp.cn) 数据快照与 [16688](https://www.16688.com.cn) 公开商品采集的可视化及 LangGraph AI 分析工具。原链动小铺快照含 **250 家店铺 / 11,042 件在售商品**；16688 数据由平台采集任务生成。
 
 > 🎨 **[在线宣传页](https://samge0.github.io/wzyp-view/)** — 功能总览 · AI 架构 · 快速开始
 
@@ -8,6 +8,77 @@
 - 🏪 店铺 / 🛒 商品多维查询：字段筛选构建器（≥/≤/like…）、表头+下拉双排序、抓取状态筛选、排除 0 元、商品详情抽屉
 - 💬 AI 分析：LangGraph Agent 流式对话（markdown 渲染、自动追问建议、多会话管理），支持「AI 解读」把当前查询结果一键带入聊天
 - ⚙️ 页面化配置：LLM 与 MySQL 连接全部在网页设置页配置（保存前自动测连、热生效），支持配置导入/导出
+- 🔗 **16688 平台采集**：自动发现公开店铺与商品链接，按原站店铺编号去重后批量采集；支持进度查看、取消、重启恢复与断点续跑，采集结果统一参与总览、筛选、详情和 AI 分析。
+
+## 采集 16688 平台公开商品
+
+16688 数据源无需安装 MySQL 或导入原链动小铺快照。按下方步骤安装 Python 依赖、运行 `python run.py`，打开 **http://127.0.0.1:8770** 即可。
+
+1. 顶栏选择 **16688 交易平台**（新浏览器默认选中）。
+2. 点击 **发现并采集公开商品**。程序读取公开索引的全部商品分页，从中提取 16688 店铺／商品链接，再向 16688 原站采集各店的公开商品；商品描述中的 16688 链接也会加入发现队列。
+3. 面板每两秒更新发现链接、核验店铺、成功／失败数量、商品数和待处理数量。**取消采集**会停止后续请求并保留已完成快照；**继续采集**跳过已完成店铺，重试失败或未完成的部分。
+4. 以后点击 **刷新已收录店铺**，可更新已经收录的店铺，无需重新读取公开索引。
+5. 在总览查看统计、在店铺与商品页搜索筛选、点击商品名称查看详情。配置 LLM 后可使用 AI 分析。
+
+展开 **补充链接 / 单店同步** 可每行添加一个 16688 链接，加入下一次批量任务，也可仅同步明确指定的一个店铺。默认不绑定任何特定商品或店铺。
+
+也可以从命令行采集：
+
+```bash
+# 自动发现并批量采集公开商品
+python platform16688.py crawl
+
+# 仅刷新已收录店铺
+python platform16688.py refresh
+
+# JOB_ID 替换为任务启动时输出的编号
+python platform16688.py crawl --resume JOB_ID
+
+# 补充公开入口，可重复传入 --url
+python platform16688.py crawl --url https://www.16688.com.cn/shop/XIAOQING
+
+# 兼容原有显式链接的单店同步
+python platform16688.py https://www.16688.com.cn/goods/G74884541
+```
+
+CLI 每次进度变化会输出任务编号及统计；`Ctrl+C` 取消当前 CLI 创建的任务。网页和 CLI 共用同一数据库时，只允许一个平台任务运行，重复启动会返回已有任务。服务重启后，未完成任务会标记为中断，点击继续或使用 `--resume` 恢复；不会自动定时执行。
+
+默认两个采集工作线程，进程内共享每秒两次请求的限速。超时、连接失败、HTTP 429 和临时服务器错误每个请求最多尝试三次，并遵循 `Retry-After`（最长等待 60 秒）。失效店铺、商品和读取失败会记录具体入口，不会阻断其他店铺。
+
+数据及任务检查点默认保存在 `data/16688.sqlite3`，可通过 `WZYP_16688_DB` 指定文件。旧版 SQLite 会自动增加任务表，已有快照保持不变。每个店铺完整读取成功后才更新该店快照，并移除已不在公开列表中的商品；其他店铺保持不变。网络失败、平台返回异常或不完整列表时保留之前的数据。Docker 的 `./data` 挂载同时保存快照与采集任务。
+
+**发现来源与覆盖范围**：首个发现源为 [PriceMap AI 公开索引](https://pricemapai.com/data/latest.json)，使用版本化清单校验全部商品分页；版本变化或分页失效时重新读取一次，仍不完整则保留旧数据并报告。第三方索引仅用于发现链接，价格、库存、描述和分类均从 16688 原站采集。只跟随已公开的 16688 商品／店铺链接，不枚举编号、不使用商家登录态。公开索引有收录范围，结果应称为“已发现公开店铺的商品快照”，不代表全站或全部类目完整数据。
+
+**数据口径**：价格为公开标价，未含平台手续费；未公开的市场价、实付价和开店日期保留为空。“1.3万+付款”以原文保存，排名与汇总使用 13,000 作为公开下限，不代表精确销量。`auto` / `manual` / `unknown` 分别表示自动发货、手动发货和未公开发货方式；手动发货返回的库存 `-1` 按未公开数量处理。平台商品分类单独保存。HTML 描述在受限 iframe 中显示。
+
+切换到 **链动小铺** 仍使用原 MySQL 配置。两个数据源的数据库、AI 查询上下文及聊天历史分别保存；原有 API 不传 `source` 时仍默认使用链动小铺。
+
+![16688 平台采集进度与数据总览](docs/screenshot-16688.png)
+
+新增接口：
+
+| 接口 | 说明 |
+|------|------|
+| `GET /api/sources` | 可用数据源 |
+| `POST /api/sources/16688/crawl` | `{"mode":"discover","urls":[]}`；mode 为 discover（默认）或 refresh |
+| `GET /api/sources/16688/crawl` | 最近的任务，优先返回运行中的任务：`{"job":任务或null}` |
+| `GET /api/sources/16688/crawl/{job_id}` | 指定任务的状态、进度与最近失败记录 |
+| `POST /api/sources/16688/crawl/{job_id}/cancel` | 取消任务，返回任务编号及状态 |
+| `POST /api/sources/16688/crawl/{job_id}/resume` | 续跑失败、部分完成、中断或取消的任务 |
+| `POST /api/sources/16688/sync` | 请求体 `{"url":"https://www.16688.com.cn/shop/XIAOQING"}` |
+| `/api/stats?source=16688` | 本地快照统计 |
+| `/api/shops?source=16688`、`/api/goods?source=16688` | 复用原查询请求体 |
+| `/api/goods/{goods_key}?source=16688` | 商品详情 |
+| `/api/chat?source=16688` | 当前数据源的 AI 分析 |
+| `GET /api/health` | 服务健康检查，不依赖 MySQL 或 LLM |
+
+任务响应包含 `job_id`、`mode`、`status`、`phase`、`discovered_links`、`resolved_shops`、`success_shops`、`failure_count`、`collected_goods`、`pending_links`、`updated_at` 和失败记录。状态包括 `running`、`cancelling`、`cancelled`、`interrupted`、`completed`、`partial`、`failed`。任务表与队列表不在 AI 查询权限内。
+
+离线回归测试（使用仓库依赖中的 HTTPX，无需实际商店网络、MySQL 或 LLM 服务）：
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## 界面预览
 
@@ -35,7 +106,7 @@
 
 ### 方式一：本地运行（uv）
 
-#### 1. 准备数据
+#### 1. 准备数据（仅链动小铺需要，使用 16688 可跳过）
 
 从 [Releases](../../releases) 下载 `wzyp-data.zip`（约 16 MB，含三张表全量数据），解压后导入 MySQL：
 
@@ -147,7 +218,13 @@ planner(LLM+bind_tools) ⇄ tools(只读SQL+schema) → END
 wzyp-view/
 ├── server.py          # FastAPI（静态 + 数据API + SSE + 设置/导入导出API）
 ├── agent.py           # LangGraph Agent（工具/记忆/流式/追问建议）
-├── db.py              # MySQL 查询层（连接池，配置热重建）
+├── db.py              # 双数据源查询层（MySQL 连接池 / SQLite 只读查询）
+├── local_store.py     # 16688 SQLite 快照与只读查询
+├── platform16688.py   # 16688 公开接口采集 / 命令行同步
+├── crawler16688.py    # 公开索引发现、后台批量采集与 CLI
+├── crawl_store.py     # 持久化任务、队列、店铺别名与检查点
+├── public_http.py     # 共享限速、有限重试、可中断请求
+├── tests/             # 单店/平台采集、恢复、迁移、API、AI 隔离测试
 ├── config.py          # 配置加载（settings.json + env，llm/db 双段）
 ├── static/index.html  # 前端 SPA（原生 JS 单文件）
 ├── data/              # settings.json + 聊天记忆（运行时生成，已 gitignore）
