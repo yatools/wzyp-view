@@ -17,7 +17,7 @@ def active_source():
 
 @contextmanager
 def use_source(source):
-    if source not in {"wzyp", "16688"}:
+    if source not in {"wzyp", "wzyp-live", "16688"}:
         raise ValueError("未知数据源")
     token = _source.set(source)
     try:
@@ -46,9 +46,11 @@ def rebuild_pool():
             _pool.close()
         _pool = None
 
+
 def query(sql, args=None, one=False):
-    if active_source() == "16688":
-        rows = local_store.readonly_query(sql, args)
+    src = active_source()
+    if src in {"16688", "wzyp-live"}:
+        rows = local_store.readonly_query(sql, args, path=local_store.database_path(src))
         return (rows[0] if rows else None) if one else rows
     import pymysql
     global _pool
@@ -136,8 +138,12 @@ def list_shops(kw=None, filters=None, fetch_status=None, sort="goods_count", ord
                (SELECT ROUND(AVG(g.price),2) FROM wzyp_goods g WHERE g.shop_token=s.token) AS avg_price,
                (SELECT COUNT(*) FROM wzyp_goods g WHERE g.shop_token=s.token) AS fetched_count
                FROM wzyp_shops s) s"""
-    local_columns = ("s.auto_count, s.manual_count, s.unknown_count, s.sales_count_text, s.synced_at, "
-                     if active_source() == "16688" else "")
+    if active_source() == "16688":
+        local_columns = "s.auto_count, s.manual_count, s.unknown_count, s.sales_count_text, s.synced_at, "
+    elif active_source() == "wzyp-live":
+        local_columns = "s.synced_at, "
+    else:
+        local_columns = ""
     total = query(f"SELECT COUNT(*) AS c FROM {base} WHERE {where}", args, one=True)["c"]
     rows = query(f"""
         SELECT s.token, s.nickname, s.login_province, s.contact_qq, s.contact_wechat,
@@ -284,15 +290,26 @@ def schema_text():
         n3 = query("SELECT COUNT(*) AS c FROM wzyp_goods_detail", one=True)["c"]
     except Exception:
         n1, n2, n3 = "?", "?", "?"
-    source_info = (
-        "当前数据源：16688.com.cn 的本地 SQLite 店铺快照。使用 SQLite SELECT 语法。\n"
-        "仅代表已同步店铺，并非平台全站数据。price 是未含手续费的商品标价；real_price/market_price 未公开，为 NULL。\n"
-        "商品类型 auto=自动发货、manual=手动发货、unknown=未公开；不要将它们当作链动小铺商品分类。\n"
-        "店铺 sell_count 是公开付款数量的下限，必须结合 sales_count_text 原文解释万+，不可称精确销量。\n"
-        "店铺附加字段：auto_count/manual_count/unknown_count、sales_count_text、synced_at。\n"
-        "商品和详情附加字段：sales_count_text、stock_quantity、stock_status、category_name、synced_at。\n"
-        "商品 link 格式 https://www.16688.com.cn/goods/<goods_key>；店铺 link 为平台真实店铺链接。\n"
-        if active_source() == "16688" else "当前数据源：链动小铺 wzyp.cn 的 MySQL 数据。\n")
+    if active_source() == "16688":
+        source_info = (
+            "当前数据源：16688.com.cn 的本地 SQLite 店铺快照。使用 SQLite SELECT 语法。\n"
+            "仅代表已同步店铺，并非平台全站数据。price 是未含手续费的商品标价；real_price/market_price 未公开，为 NULL。\n"
+            "商品类型 auto=自动发货、manual=手动发货、unknown=未公开；不要将它们当作链动小铺商品分类。\n"
+            "店铺 sell_count 是公开付款数量的下限，必须结合 sales_count_text 原文解释万+，不可称精确销量。\n"
+            "店铺附加字段：auto_count/manual_count/unknown_count、sales_count_text、synced_at。\n"
+            "商品和详情附加字段：sales_count_text、stock_quantity、stock_status、category_name、synced_at。\n"
+            "商品 link 格式 https://www.16688.com.cn/goods/<goods_key>；店铺 link 为平台真实店铺链接。\n"
+        )
+    elif active_source() == "wzyp-live":
+        source_info = (
+            "当前数据源：链动小铺 wzyp.cn 的本地 SQLite 最新采集快照（source=wzyp-live）。使用 SQLite SELECT 语法。\n"
+            "仅代表已发现公开店铺的商品快照，并非平台全站数据。price/real_price/market_price 为原站公开价格口径；未公开库存字段为 NULL。\n"
+            "商品类型 card=卡密、article=文章、resource=资源、equity=权益。\n"
+            "商品详情附加字段：category_name（商品分类）、synced_at（同步时间）。\n"
+            "店铺 link 格式 https://wzyp.cn/shop/<token>；商品 link 格式 https://wzyp.cn/item/<goods_key>。\n"
+        )
+    else:
+        source_info = "当前数据源：链动小铺 wzyp.cn 的 MySQL 数据。\n"
     example_type = "auto" if active_source() == "16688" else "equity"
     example_type2 = "manual" if active_source() == "16688" else "resource"
     example_type3 = "auto" if active_source() == "16688" else "card"

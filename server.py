@@ -1,6 +1,7 @@
 """wzyp-view 后端：FastAPI 静态 + API + SSE"""
 import json
 import os
+import sys
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -12,21 +13,29 @@ from pydantic import BaseModel, Field
 import config as cfg
 import db
 import platform16688
+import platformwzyp
 from crawler16688 import CrawlManager
 from crawl_store import JobConflict
 from config import BASE_DIR
+from public_http import CrawlBlockedError
 
-Source = Literal["wzyp", "16688"]
+Source = Literal["wzyp", "wzyp-live", "16688"]
 crawler = CrawlManager()
+wzyp_crawler = CrawlManager(platform_adapter=platformwzyp)
 
 
 @asynccontextmanager
 async def lifespan(app):
     crawler.recover_interrupted()
+    wzyp_crawler.recover_interrupted()
     try:
         yield
     finally:
         crawler.shutdown()
+        wzyp_crawler.shutdown()
+        agent_mod = sys.modules.get("agent")
+        if agent_mod and hasattr(agent_mod, "close_http_clients"):
+            agent_mod.close_http_clients()
 
 
 def get_agent():
@@ -36,7 +45,8 @@ def get_agent():
 
 
 def memory_id(thread_id, source):
-    return f"16688:{thread_id}" if source == "16688" else thread_id
+    return thread_id if source == "wzyp" else f"{source}:{thread_id}"
+
 
 app = FastAPI(title="wzyp-view", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
@@ -66,8 +76,10 @@ def health():
 @app.get("/api/sources")
 def sources():
     return {"sources": [{"id": "wzyp", "name": "链动小铺", "storage": "MySQL"},
+                        {"id": "wzyp-live", "name": "链动小铺（最新采集）", "storage": "SQLite"},
                         {"id": "16688", "name": "16688 交易平台", "storage": "SQLite"}],
-            "example_url": platform16688.EXAMPLE_URL}
+            "example_url": platform16688.EXAMPLE_URL,
+            "wzyp_example_url": platformwzyp.EXAMPLE_URL}
 
 
 class SyncRequest(BaseModel):
@@ -81,6 +93,16 @@ def sync_16688(body: SyncRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except platform16688.PlatformError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/sources/wzyp/sync")
+def sync_wzyp(body: SyncRequest):
+    try:
+        return platformwzyp.sync_shop(body.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (platformwzyp.PlatformError, CrawlBlockedError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
@@ -124,6 +146,47 @@ def cancel_crawl(job_id: str):
 def resume_crawl(job_id: str):
     try:
         return crawler.resume(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="采集任务不存在") from exc
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/sources/wzyp/crawl")
+def start_wzyp_crawl(body: CrawlRequest):
+    try:
+        return wzyp_crawler.start(body.mode, body.urls)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/sources/wzyp/crawl")
+def latest_wzyp_crawl():
+    wzyp_crawler.recover_interrupted()
+    return {"job": wzyp_crawler.store.report()}
+
+
+@app.get("/api/sources/wzyp/crawl/{job_id}")
+def wzyp_crawl_progress(job_id: str):
+    wzyp_crawler.recover_interrupted()
+    report = wzyp_crawler.store.report(job_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="采集任务不存在")
+    return report
+
+
+@app.post("/api/sources/wzyp/crawl/{job_id}/cancel")
+def cancel_wzyp_crawl(job_id: str):
+    try:
+        return wzyp_crawler.cancel(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="采集任务不存在") from exc
+
+
+@app.post("/api/sources/wzyp/crawl/{job_id}/resume")
+def resume_wzyp_crawl(job_id: str):
+    try:
+        return wzyp_crawler.resume(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="采集任务不存在") from exc
     except JobConflict as exc:
@@ -211,18 +274,22 @@ def save_settings(body: LLMSettings):
         "baseurl": body.baseurl or current["baseurl"],
         "model": body.model or current["model"],
         "apikey": body.apikey if body.apikey and not body.apikey.endswith("...") else current.get("apikey", "")})
+    get_agent().invalidate_settings()
     return {"ok": True}
 
 
 @app.get("/api/llm/test")
 def test_llm():
     """LLM 连通性测试"""
+    agent = get_agent()
     try:
-        llm = get_agent().build_llm()
+        llm = agent.build_llm()
         r = llm.invoke("回复:OK")
         return {"ok": True, "reply": str(r.content)[:50]}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
+        info = agent.classify_llm_error(e)
+        return {"ok": False, "error": info["error"], "error_type": info["error_type"],
+                "status_code": info["status_code"]}
 
 
 # ---- 数据库配置 ----
@@ -310,6 +377,7 @@ def config_import(body: ConfigImport):
         llm = {k: c[k] for k in ("baseurl", "model", "apikey") if k in c}
     if llm:
         cfg.save_settings(llm=llm)
+        get_agent().invalidate_settings()
     if dbc:
         try:
             import pymysql as _pym
@@ -330,12 +398,15 @@ def config_import(body: ConfigImport):
 class ChatBody(BaseModel):
     thread_id: str = "default"
     message: str
+    source: Source | None = None
 
 
 @app.post("/api/chat")
 def chat(body: ChatBody, source: Source = "wzyp"):
+    active_source: Source = body.source or source
+
     def gen():
-        for evt, payload in get_agent().run_agent_stream(memory_id(body.thread_id, source), body.message, source=source):
+        for evt, payload in get_agent().run_agent_stream(memory_id(body.thread_id, active_source), body.message, source=active_source):
             data = json.dumps({"event": evt, "data": payload}, ensure_ascii=False)
             yield f"data: {data}\n\n"
         yield "data: [DONE]\n\n"

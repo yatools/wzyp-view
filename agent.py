@@ -3,9 +3,14 @@
   planner(LLM+工具) → tools(只读SQL) → analyst(总结成中文洞察)
 记忆：SqliteSaver 持久化 thread 会话（跨请求多轮对话）
 """
+import ipaddress
 import json
+import os
+import re
 import threading
+from urllib.parse import urlparse
 
+import httpx
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph, START
@@ -16,6 +21,74 @@ import db
 from config import CHECKPOINTER_DB, get_llm_config, load_settings, save_settings
 
 _lock = threading.Lock()
+_http_client_key = None
+_http_sync_client: httpx.Client | None = None
+_http_async_client: httpx.AsyncClient | None = None
+
+
+def is_loopback_url(url: str) -> bool:
+    """判断 Base URL 的主机是否为 localhost、IPv4 回环地址或 IPv6 ::1"""
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    host = (parsed.hostname or "").strip().lower().strip("[]")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_loopback:
+            return True
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None and mapped.is_loopback:
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def _proxy_env_signature() -> tuple:
+    names = (
+        "OPENAI_PROXY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "no_proxy",
+    )
+    return tuple((k, os.environ.get(k, "")) for k in names)
+
+
+def _close_clients_unlocked():
+    global _http_client_key, _http_sync_client, _http_async_client
+    sync_client, async_client = _http_sync_client, _http_async_client
+    _http_client_key = None
+    _http_sync_client = None
+    _http_async_client = None
+    if sync_client is not None:
+        try:
+            sync_client.close()
+        except Exception:
+            pass
+    if async_client is not None:
+        try:
+            # AsyncClient without active event loop can close underlying transport if needed
+            transport = getattr(async_client, "_transport", None)
+            if transport is not None and hasattr(transport, "close"):
+                transport.close()
+        except Exception:
+            pass
+
+
+def close_http_clients():
+    """在服务关闭或重置时释放受控 HTTP 客户端连接"""
+    with _lock:
+        _close_clients_unlocked()
 
 
 def get_llm_settings():
@@ -25,18 +98,147 @@ def get_llm_settings():
 
 
 def invalidate_settings():
-    """保留兼容：config 每次实时读取，无需失效缓存"""
-    pass
+    """保存配置后失效并关闭已缓存的 HTTP 客户端，使新请求立即使用新配置"""
+    close_http_clients()
+
+
+def _get_http_clients(baseurl: str) -> tuple[httpx.Client, httpx.AsyncClient]:
+    global _http_client_key, _http_sync_client, _http_async_client
+    loopback = is_loopback_url(baseurl)
+    key = ("loopback", baseurl) if loopback else ("remote", baseurl, _proxy_env_signature())
+    with _lock:
+        if (
+            _http_client_key == key
+            and _http_sync_client is not None
+            and not _http_sync_client.is_closed
+            and _http_async_client is not None
+            and not _http_async_client.is_closed
+        ):
+            return _http_sync_client, _http_async_client
+
+        _close_clients_unlocked()
+        if loopback:
+            _http_sync_client = httpx.Client(trust_env=False, timeout=60.0)
+            _http_async_client = httpx.AsyncClient(trust_env=False, timeout=60.0)
+        else:
+            openai_proxy = (os.environ.get("OPENAI_PROXY") or "").strip() or None
+            if openai_proxy:
+                _http_sync_client = httpx.Client(proxy=openai_proxy, trust_env=True, timeout=60.0)
+                _http_async_client = httpx.AsyncClient(proxy=openai_proxy, trust_env=True, timeout=60.0)
+            else:
+                _http_sync_client = httpx.Client(trust_env=True, timeout=60.0)
+                _http_async_client = httpx.AsyncClient(trust_env=True, timeout=60.0)
+        _http_client_key = key
+        return _http_sync_client, _http_async_client
 
 
 def build_llm():
     s = get_llm_settings()
+    sync_client, async_client = _get_http_clients(s["baseurl"])
     return ChatOpenAI(
-        base_url=s["baseurl"], model=s["model"],
+        base_url=s["baseurl"],
+        model=s["model"],
         api_key=s.get("apikey") or "EMPTY",
-        temperature=0.2, timeout=60, max_retries=1,
+        temperature=0.2,
+        timeout=60,
+        max_retries=1,
         streaming=True,
+        http_client=sync_client,
+        http_async_client=async_client,
+        openai_proxy="",
+        http_socket_options=(),
     )
+
+
+def redact_sensitive(text: str, apikey: str | None = None) -> str:
+    """对错误文本中的 API Key 与 Bearer 凭据脱敏"""
+    out = str(text or "")
+    key = (apikey if apikey is not None else get_llm_settings().get("apikey") or "").strip()
+    if key and key != "EMPTY":
+        out = out.replace(key, "***")
+    out = re.sub(r"Bearer\s+[A-Za-z0-9._\-]+", "Bearer ***", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bsk-[A-Za-z0-9_\-]{6,}", "sk-***", out)
+    return out
+
+
+def classify_llm_error(exc: Exception, apikey: str | None = None) -> dict:
+    """分类 LLM 异常并生成脱敏、可读的错误说明"""
+    settings = get_llm_settings()
+    key = apikey if apikey is not None else settings.get("apikey") or ""
+    raw_msg = redact_sensitive(str(exc or ""), key).strip()
+
+    status_code = getattr(exc, "status_code", None)
+    resp = getattr(exc, "response", None)
+    if status_code is None and resp is not None:
+        status_code = getattr(resp, "status_code", None)
+    if status_code is None:
+        m = re.search(r"\b(?:Error code|HTTP|status(?:\s+code)?)\s*[:=]?\s*([45]\d{2})\b", raw_msg, re.IGNORECASE)
+        if m:
+            status_code = int(m.group(1))
+
+    body_detail = ""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err_obj = body.get("error")
+        if isinstance(err_obj, dict):
+            body_detail = str(err_obj.get("message") or err_obj.get("code") or "")
+        elif err_obj:
+            body_detail = str(err_obj)
+        else:
+            body_detail = str(body.get("message") or body.get("detail") or "")
+    elif isinstance(body, str) and body.strip():
+        body_detail = body.strip()
+    elif resp is not None:
+        try:
+            resp_text = (resp.text or "").strip()
+            if resp_text:
+                body_detail = resp_text[:200]
+        except Exception:
+            pass
+    body_detail = redact_sensitive(body_detail, key).strip()
+
+    cls_name = exc.__class__.__name__
+    lower_msg = f"{cls_name} {raw_msg} {body_detail}".lower()
+
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)) or cls_name == "APITimeoutError" or "timed out" in lower_msg or "timeout" in lower_msg:
+        error_type = "timeout"
+        prefix = "请求超时"
+    elif status_code in (401, 403) or cls_name in ("AuthenticationError", "PermissionDeniedError") or "unauthorized" in lower_msg or "invalid api key" in lower_msg:
+        error_type = "auth_error"
+        status_code = status_code or 401
+        prefix = f"鉴权失败 (HTTP {status_code})"
+    elif status_code == 503:
+        error_type = "service_503"
+        prefix = "服务暂不可用 (HTTP 503)"
+    elif (
+        status_code is None
+        and (
+            isinstance(exc, httpx.TransportError)
+            or cls_name == "APIConnectionError"
+            or any(k in lower_msg for k in ("connection error", "connecterror", "connection refused", "积极拒绝", "无法连接", "all connection attempts failed"))
+        )
+    ):
+        error_type = "connection_error"
+        prefix = "连接失败"
+    elif status_code is not None:
+        error_type = "http_error"
+        prefix = f"请求失败 (HTTP {status_code})"
+    else:
+        error_type = "unknown_error"
+        prefix = "请求异常"
+
+    detail = body_detail if (body_detail and re.fullmatch(r"Error code:\s*\d+", raw_msg)) else raw_msg
+    if body_detail and body_detail not in detail:
+        detail = f"{detail} ({body_detail})" if detail else body_detail
+    if not detail or re.fullmatch(r"Error code:\s*503", detail):
+        detail = f"模型服务 ({settings.get('baseurl', '')}) 返回 HTTP 503，上游模型繁忙或网关不可用"
+
+    message = detail if detail.startswith(prefix) else f"{prefix}：{detail}"
+    return {
+        "error": message,
+        "error_type": error_type,
+        "status_code": status_code,
+    }
 
 
 # ---------------- 工具 ----------------
@@ -84,13 +286,26 @@ SYSTEM_PROMPT = """你是店铺数据分析助手，擅长用中文回答关于�
 - 价格统一 ¥ 保留两位小数。"""
 
 
+def _source_note_for(source: str | None) -> str:
+    if source == "16688":
+        return (
+            "当前数据源：16688.com.cn，SQLite 快照。价格未含手续费，万+销量为公开下限；"
+            "auto/manual/unknown 是发货方式。只分析已同步店铺。"
+        )
+    if source == "wzyp-live":
+        return (
+            "当前数据源：链动小铺 wzyp.cn（最新采集），SQLite 快照。"
+            "仅包含已发现公开店铺的商品快照，不代表全站覆盖；"
+            "goods_type 为 card/article/resource/equity，含 category_name 与 synced_at。"
+        )
+    return "当前数据源：链动小铺 wzyp.cn，MySQL。"
+
+
 def planner_node(state: AgentState):
     llm = build_llm().bind_tools(TOOLS)
     msgs = list(state["messages"])
     # 每轮都注入纪律头（小模型对长历史中的系统提示会"遗忘"）
-    source_note = ("当前数据源：16688.com.cn，SQLite 快照。价格未含手续费，万+销量为公开下限；"
-                   "auto/manual/unknown 是发货方式。只分析已同步店铺。"
-                   if state.get("source") == "16688" else "当前数据源：链动小铺 wzyp.cn，MySQL。")
+    source_note = _source_note_for(state.get("source"))
     msgs = [SystemMessage(content=SYSTEM_PROMPT + "\n\n" + source_note)] + [m for m in msgs if not isinstance(m, SystemMessage)]
     # 追问轮防复读：若最后一条是人类消息且历史上已有 AI 回复，附加路由提示
     if len(msgs) > 3 and isinstance(msgs[-1], HumanMessage) and "（系统提示）" not in msgs[-1].content:
@@ -276,8 +491,7 @@ def suggest_followups(question: str, answer: str) -> list:
         ])
         text = (r.content or "").strip()
         # 提取 JSON 数组（容忍 markdown 代码块包裹）
-        import re as _re
-        m = _re.search(r'\[[\s\S]*\]', text)
+        m = re.search(r'\[[\s\S]*\]', text)
         if m:
             arr = json.loads(m.group(0))
             return [str(x)[:40] for x in arr[:3] if x]
@@ -335,4 +549,9 @@ def run_agent_stream(thread_id: str, user_text: str, sse=True, source="wzyp"):
         if followups:
             yield "followups", followups
     except Exception as e:
-        yield "error", {"message": str(e)}
+        info = classify_llm_error(e)
+        yield "error", {
+            "message": info["error"],
+            "error_type": info["error_type"],
+            "status_code": info["status_code"],
+        }

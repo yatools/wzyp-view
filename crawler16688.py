@@ -11,7 +11,7 @@ import requests
 
 import platform16688 as platform
 from crawl_store import ACTIVE, CrawlStore
-from public_http import CrawlCancelled, PublicSession
+from public_http import CrawlBlockedError, CrawlCancelled, PublicSession
 
 INDEX_ORIGIN = "https://pricemapai.com"
 INDEX_MANIFEST = f"{INDEX_ORIGIN}/data/latest.json"
@@ -89,15 +89,27 @@ def discover_public(session, progress=None):
 
 
 class CrawlManager:
-    def __init__(self, path=None, session_factory=None, discover=None):
-        self.store = CrawlStore(path)
-        self.session_factory = session_factory or (lambda stop: PublicSession(stop=stop))
-        self.discover = discover or discover_public
+    def __init__(self, path=None, session_factory=None, discover=None, platform_adapter=None):
+        self.platform = platform_adapter or platform
+        self.store = CrawlStore(path, platform_adapter=self.platform)
+        if session_factory is not None:
+            self.session_factory = session_factory
+        elif hasattr(self.platform, "session_factory"):
+            self.session_factory = self.platform.session_factory
+        else:
+            self.session_factory = lambda stop: PublicSession(stop=stop)
+        if discover is not None:
+            self.discover = discover
+        elif hasattr(self.platform, "discover_public"):
+            self.discover = self.platform.discover_public
+        else:
+            self.discover = discover_public
         self.lock = threading.Lock()
         self.thread = None
         self.job_id = None
         self.stop = None
         self.shutting_down = None
+        self.block_error = None
 
     def recover_interrupted(self):
         self.store.recover()
@@ -106,8 +118,10 @@ class CrawlManager:
         self.job_id = job_id
         self.stop = threading.Event()
         self.shutting_down = threading.Event()
+        self.block_error = None
+        prefix = getattr(self.platform, "SOURCE_KEY", "16688")
         self.thread = threading.Thread(target=self._run, args=(job_id, self.stop, self.shutting_down),
-                                       name="16688-crawl", daemon=True)
+                                       name=f"{prefix}-crawl", daemon=True)
         try:
             self.thread.start()
         except Exception:
@@ -117,7 +131,7 @@ class CrawlManager:
     def start(self, mode="discover", urls=None):
         if mode not in {"discover", "refresh"}:
             raise ValueError("mode 应为 discover 或 refresh")
-        urls = [platform.normalize_target(url)["url"] for url in (urls or [])]
+        urls = [self.platform.normalize_target(url)["url"] for url in (urls or [])]
         with self.lock:
             self.recover_interrupted()
             job_id, reused = self.store.create(mode, urls)
@@ -157,11 +171,11 @@ class CrawlManager:
                     if not claimed:
                         self.store.finish_item(item, "skipped", shop_no)
                         return
-                url = f"{platform.BASE_URL}/shop/{shop_no}" if shop_no else item["url"]
-                resolved = platform.resolve_target(url, session)
+                url = f"{self.platform.BASE_URL}/shop/{shop_no}" if shop_no else item["url"]
+                resolved = self.platform.resolve_target(url, session)
                 shop = resolved[0]
                 if shop_no and shop_no != shop["shop_no"]:
-                    raise platform.PlatformError("店铺编号与已核验入口不一致")
+                    raise self.platform.PlatformError("店铺编号与已核验入口不一致")
                 shop_no = shop["shop_no"]
                 self.store.remember(item, shop)
                 if not claimed:
@@ -169,8 +183,14 @@ class CrawlManager:
                     if not claimed:
                         self.store.finish_item(item, "skipped", shop_no)
                         return
-                result = platform.sync_shop(url, session=session, resolved=resolved, store_path=self.store.path)
+                result = self.platform.sync_shop(url, session=session, resolved=resolved, store_path=self.store.path)
                 self.store.finish_item(item, "done", shop_no, result=result)
+        except CrawlBlockedError as exc:
+            self.block_error = str(exc)[:400]
+            if self.shutting_down:
+                self.shutting_down.set()
+            stop.set()
+            self.store.finish_item(item, "pending", shop_no if claimed else None)
         except CrawlCancelled:
             self.store.finish_item(item, "pending", shop_no if claimed else None)
         except Exception as exc:
@@ -178,13 +198,14 @@ class CrawlManager:
 
     def _run(self, job_id, stop, shutting_down):
         pulse_done = threading.Event()
+        prefix = getattr(self.platform, "SOURCE_KEY", "16688")
 
         def pulse():
             while not pulse_done.wait(1):
                 if self.store.heartbeat(job_id):
                     stop.set()
 
-        heartbeat_thread = threading.Thread(target=pulse, daemon=True, name="16688-heartbeat")
+        heartbeat_thread = threading.Thread(target=pulse, daemon=True, name=f"{prefix}-heartbeat")
         heartbeat_thread.start()
         try:
             job = self.store.report(job_id)
@@ -194,11 +215,15 @@ class CrawlManager:
                     with self.session_factory(stop) as session:
                         urls = self.discover(session, lambda version, pages: self.store.discovery_progress(job_id, version, pages))
                     self.store.discovery_finished(job_id, urls)
-                except platform.PlatformError as exc:
+                except CrawlBlockedError as exc:
+                    self.block_error = str(exc)[:400]
+                    shutting_down.set()
+                    stop.set()
+                except self.platform.PlatformError as exc:
                     self.store.discovery_finished(job_id, error=str(exc)[:400])
             if job["mode"] == "refresh":
                 self.store.discovery_finished(job_id, [])
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="16688-shop") as pool:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{prefix}-shop") as pool:
                 futures = set()
                 while True:
                     if self.store.heartbeat(job_id):
@@ -214,13 +239,18 @@ class CrawlManager:
                     for future in done:
                         future.result()
             report = self.store.report(job_id)
-            if stop.is_set():
+            if self.block_error:
+                self.store.finish_job(job_id, "interrupted", self.block_error)
+            elif stop.is_set():
                 status = "interrupted" if shutting_down.is_set() else "cancelled"
+                self.store.finish_job(job_id, status)
             elif report["failure_count"] or report["discovery_error"]:
                 status = "partial" if report["success_shops"] else "failed"
+                self.store.finish_job(job_id, status)
             else:
-                status = "completed"
-            self.store.finish_job(job_id, status)
+                self.store.finish_job(job_id, "completed")
+        except CrawlBlockedError as exc:
+            self.store.finish_job(job_id, "interrupted", str(exc)[:400])
         except CrawlCancelled:
             self.store.finish_job(job_id, "interrupted" if shutting_down.is_set() else "cancelled")
         except Exception as exc:
@@ -230,8 +260,8 @@ class CrawlManager:
             heartbeat_thread.join(timeout=2)
 
 
-def run_cli(mode, urls, resume):
-    manager = CrawlManager()
+def run_cli(mode, urls, resume, platform_adapter=None):
+    manager = CrawlManager(platform_adapter=platform_adapter)
     try:
         report = manager.resume(resume) if resume else manager.start(mode, urls)
         job_id = report["job_id"]

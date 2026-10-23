@@ -1,7 +1,7 @@
-"""16688 本地快照。沿用查询表名，与原有 MySQL 数据独立保存。"""
+"""本地 SQLite 快照存储（支持 16688 与链动小铺 wzyp-live）。沿用查询表名，与原有 MySQL 数据独立保存。"""
+from datetime import datetime
 import os
 import sqlite3
-from datetime import datetime
 
 from config import BASE_DIR
 
@@ -9,7 +9,7 @@ from config import BASE_DIR
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wzyp_shops (
     token TEXT PRIMARY KEY, nickname TEXT NOT NULL, login_province TEXT,
-    contact_qq TEXT, contact_wechat TEXT, sell_count INTEGER,
+    contact_qq TEXT, contact_mobile TEXT, contact_wechat TEXT, sell_count INTEGER,
     sales_count_text TEXT, deposit_money REAL, goods_count INTEGER NOT NULL,
     card_count INTEGER DEFAULT 0, article_count INTEGER DEFAULT 0,
     resource_count INTEGER DEFAULT 0, equity_count INTEGER DEFAULT 0,
@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS wzyp_goods (
 CREATE INDEX IF NOT EXISTS goods_shop ON wzyp_goods(shop_token);
 CREATE TABLE IF NOT EXISTS wzyp_goods_detail (
     goods_key TEXT PRIMARY KEY REFERENCES wzyp_goods(goods_key) ON DELETE CASCADE,
+    shop_token TEXT,
     name TEXT NOT NULL, price REAL, real_price REAL, market_price REAL,
     goods_type TEXT NOT NULL, image TEXT, description TEXT, link TEXT NOT NULL,
     sales_count_text TEXT, stock_quantity INTEGER, stock_status TEXT,
@@ -62,9 +63,51 @@ CREATE TABLE IF NOT EXISTS crawl_aliases (
 );
 """
 
+_INCREMENTAL_COLUMNS = {
+    "wzyp_shops": [
+        ("contact_mobile", "TEXT"),
+        ("sales_count_text", "TEXT"),
+        ("auto_count", "INTEGER DEFAULT 0"),
+        ("manual_count", "INTEGER DEFAULT 0"),
+        ("unknown_count", "INTEGER DEFAULT 0"),
+        ("synced_at", "TEXT"),
+    ],
+    "wzyp_goods": [
+        ("sales_count_text", "TEXT"),
+        ("stock_quantity", "INTEGER"),
+        ("stock_status", "TEXT"),
+        ("category_name", "TEXT"),
+        ("synced_at", "TEXT"),
+    ],
+    "wzyp_goods_detail": [
+        ("shop_token", "TEXT"),
+        ("sales_count_text", "TEXT"),
+        ("stock_quantity", "INTEGER"),
+        ("stock_status", "TEXT"),
+        ("category_name", "TEXT"),
+        ("synced_at", "TEXT"),
+    ],
+}
 
-def database_path():
+
+def database_path(source: str = "16688"):
+    if source in ("wzyp-live", "wzyp"):
+        return os.environ.get("WZYP_LIVE_DB") or os.environ.get("WZYP_SQLITE_DB") or os.path.join(BASE_DIR, "data", "wzyp.sqlite3")
     return os.environ.get("WZYP_16688_DB") or os.path.join(BASE_DIR, "data", "16688.sqlite3")
+
+
+def wzyp_database_path():
+    return database_path("wzyp-live")
+
+
+def _ensure_incremental_schema(conn: sqlite3.Connection):
+    for table, cols in _INCREMENTAL_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue
+        for col_name, col_type in cols:
+            if col_name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
 
 
 def connect(path=None):
@@ -75,6 +118,7 @@ def connect(path=None):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _ensure_incremental_schema(conn)
     conn.create_function("FIELD", -1, lambda value, *items: items.index(value) + 1 if value in items else 0)
     conn.create_function("DATE_FORMAT", 2, _date_format)
     return conn
@@ -83,7 +127,10 @@ def connect(path=None):
 def _date_format(value, pattern):
     if not value:
         return None
-    return datetime.fromisoformat(value).strftime(pattern.replace("%i", "%M"))
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime(pattern.replace("%i", "%M"))
+    except ValueError:
+        return str(value)[:10]
 
 
 def save_snapshot(shop, goods, details, path=None):
@@ -107,10 +154,10 @@ def save_snapshot(shop, goods, details, path=None):
         conn.close()
 
 
-def readonly_query(sql, args=None):
-    conn = connect()
+def readonly_query(sql, args=None, path=None):
+    conn = connect(path)
     try:
-        # 查询连接禁止写入，AI 也无法修改快照或访问本机其他数据库。
+        # 查询连接禁止写入，AI 也无法修改快照或访问任务表及本机其他数据库。
         allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
                    sqlite3.SQLITE_RECURSIVE}
         tables = {"wzyp_shops", "wzyp_goods", "wzyp_goods_detail"}

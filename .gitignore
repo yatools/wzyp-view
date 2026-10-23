@@ -1,5 +1,6 @@
 data/*
 !data/settings.example.json
+!data/wzyp_seeds.json
 server.log
 __pycache__/
 *.pyc

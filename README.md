@@ -22,23 +22,22 @@
 
 展开 **补充链接 / 单店同步** 可每行添加一个 16688 链接，加入下一次批量任务，也可仅同步明确指定的一个店铺。默认不绑定任何特定商品或店铺。
 
-也可以从命令行采集：
+也可以从命令行采集（16688 与链动小铺 CLI 参数一致）：
 
 ```bash
-# 自动发现并批量采集公开商品
+# 16688 交易平台：自动发现并批量采集公开商品
 python platform16688.py crawl
-
-# 仅刷新已收录店铺
 python platform16688.py refresh
-
-# JOB_ID 替换为任务启动时输出的编号
 python platform16688.py crawl --resume JOB_ID
-
-# 补充公开入口，可重复传入 --url
 python platform16688.py crawl --url https://www.16688.com.cn/shop/XIAOQING
-
-# 兼容原有显式链接的单店同步
 python platform16688.py https://www.16688.com.cn/goods/G74884541
+
+# 链动小铺（最新采集，保存至 data/wzyp.sqlite3，source=wzyp-live）：
+python platformwzyp.py crawl
+python platformwzyp.py refresh
+python platformwzyp.py crawl --resume JOB_ID
+python platformwzyp.py crawl --url https://wzyp.cn/shop/9B5624X
+python platformwzyp.py https://wzyp.cn/shop/9B5624X
 ```
 
 CLI 每次进度变化会输出任务编号及统计；`Ctrl+C` 取消当前 CLI 创建的任务。网页和 CLI 共用同一数据库时，只允许一个平台任务运行，重复启动会返回已有任务。服务重启后，未完成任务会标记为中断，点击继续或使用 `--resume` 恢复；不会自动定时执行。
@@ -66,6 +65,7 @@ CLI 每次进度变化会输出任务编号及统计；`Ctrl+C` 取消当前 CLI
 | `POST /api/sources/16688/crawl/{job_id}/cancel` | 取消任务，返回任务编号及状态 |
 | `POST /api/sources/16688/crawl/{job_id}/resume` | 续跑失败、部分完成、中断或取消的任务 |
 | `POST /api/sources/16688/sync` | 请求体 `{"url":"https://www.16688.com.cn/shop/XIAOQING"}` |
+| `POST /api/sources/wzyp/crawl`、`GET /api/sources/wzyp/crawl*`、`POST /api/sources/wzyp/sync` | 链动小铺（最新采集 `source=wzyp-live`）批量采集、状态、取消、续跑与单店同步 |
 | `/api/stats?source=16688` | 本地快照统计 |
 | `/api/shops?source=16688`、`/api/goods?source=16688` | 复用原查询请求体 |
 | `/api/goods/{goods_key}?source=16688` | 商品详情 |

@@ -200,7 +200,7 @@ th.num{text-align:right}
 .test-result.ok{display:block;background:var(--ok-weak);color:var(--ok)}
 .test-result.bad{display:block;background:#fef2f2;color:#dc2626}
 .hint{font-size:12px;color:var(--sub);margin-top:4px}
-.source-select{border:1px solid var(--line);border-radius:8px;padding:7px;background:#fff;color:var(--txt);max-width:155px}
+.source-select{border:1px solid var(--line);border-radius:8px;padding:7px;background:#fff;color:var(--txt);max-width:195px}
 .source-panel{padding:14px 20px;background:#fff;border-bottom:1px solid var(--line);max-height:44vh;overflow:auto;flex-shrink:0}
 .source-panel .sync-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .source-panel input{flex:1;min-width:200px;border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-size:13px}
@@ -232,6 +232,7 @@ th.num{text-align:right}
   </nav>
   <div class="spacer"></div>
   <select class="source-select" id="dataSource" aria-label="数据源" onchange="switchSource(this.value)">
+    <option value="wzyp-live">链动小铺（最新采集）</option>
     <option value="16688">16688 交易平台</option>
     <option value="wzyp">链动小铺</option>
   </select>
@@ -240,13 +241,13 @@ th.num{text-align:right}
 
 <div class="source-panel" id="sourcePanel">
   <div class="sync-row">
-    <b style="font-size:14px;margin-right:auto">16688 平台公开商品采集</b>
+    <b id="sourcePanelTitle" style="font-size:14px;margin-right:auto">16688 平台公开商品采集</b>
     <button class="btn btn-primary" id="discoverButton" onclick="startCrawl('discover')">发现并采集公开商品</button>
     <button class="btn btn-ghost" id="refreshButton" onclick="startCrawl('refresh')">刷新已收录店铺</button>
     <button class="btn btn-ghost" id="cancelCrawlButton" onclick="changeCrawl('cancel')" hidden>取消采集</button>
     <button class="btn btn-primary" id="resumeCrawlButton" onclick="changeCrawl('resume')" hidden>继续采集</button>
   </div>
-  <div class="hint">已发现公开店铺的商品快照 · 从公开索引和商品链接发现多家店铺，再向 16688 原站采集。覆盖范围不代表全站完整数据。标价未含手续费，“万+付款”为公开销量下限。</div>
+  <div class="hint" id="sourcePanelHint">已发现公开店铺的商品快照 · 从公开索引和商品链接发现多家店铺，再向 16688 原站采集。覆盖范围不代表全站完整数据。标价未含手续费，“万+付款”为公开销量下限。</div>
   <div class="crawl-status" id="crawlStatus" role="status" aria-live="polite">尚未开始平台采集。已有店铺快照仍可查询。</div>
   <div id="crawlProgress" hidden>
     <div class="crawl-metrics" id="crawlMetrics"></div>
@@ -429,7 +430,7 @@ th.num{text-align:right}
 
       <div class="card">
         <h3>🗄️ 链动小铺数据库配置（MySQL）</h3>
-        <div class="hint" style="margin-bottom:12px">此配置用于链动小铺。16688 数据自动保存在 data/16688.sqlite3，无需配置数据库。</div>
+        <div class="hint" style="margin-bottom:12px">此配置仅用于原「链动小铺（MySQL）」数据源。「链动小铺（最新采集）」保存在 data/wzyp.sqlite3，「16688 交易平台」保存在 data/16688.sqlite3，均无需配置 MySQL。</div>
         <div class="form-row">
           <label>主机地址</label>
           <input id="setDbHost" placeholder="127.0.0.1">
@@ -513,7 +514,9 @@ function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show'
 let dataSource=localStorage.getItem('wzyp_source')||'16688';
 let crawlJob=null,crawlTimer=null,crawlPolling=false,crawlActionBusy=false,singleSyncBusy=false;
 let crawlLastRefresh=0,crawlLastSnapshot='';
-if(!['wzyp','16688'].includes(dataSource)) dataSource='16688';
+if(!['wzyp','wzyp-live','16688'].includes(dataSource)) dataSource='16688';
+function isCrawlableSource(src=dataSource){return src==='16688'||src==='wzyp-live'}
+function crawlApiBase(src=dataSource){return src==='wzyp-live'?'/api/sources/wzyp':'/api/sources/16688'}
 function sourceURL(path){const url=new URL(path,location.origin);url.searchParams.set('source',dataSource);return url.pathname+url.search}
 async function api(path,body){
   const r = await fetch(sourceURL(path), body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});
@@ -522,25 +525,39 @@ async function api(path,body){
 }
 window.addEventListener('unhandledrejection',e=>{toast(e.reason?.message||'请求失败，请检查连接');e.preventDefault()});
 function applySourceUI(){
-  const local=dataSource==='16688';
+  const is16688=dataSource==='16688';
+  const crawlable=isCrawlableSource();
   $('#dataSource').value=dataSource;
-  $('#sourcePanel').hidden=!local;
-  $('#salesChartTitle').textContent=local?'店铺公开销量下限 Top10':'店铺销量 Top10';
-  $('#gType').innerHTML='<option value="">全部类型</option>'+(local?
+  $('#sourcePanel').hidden=!crawlable;
+  if(dataSource==='wzyp-live'){
+    $('#sourcePanelTitle').textContent='链动小铺（最新采集）公开商品采集';
+    $('#sourcePanelHint').textContent='已发现公开店铺的商品快照 · 从原项目公开快照种子（250 家店铺）及店铺公告、商品描述中的公开链接发现店铺，逐类向 wzyp.cn 原站采集在售商品。覆盖范围仅代表已发现公开店铺，不代表全站完整数据。';
+    $('#crawlUrls').placeholder='可选：每行一个链动小铺店铺（/shop/token）或商品（/item/key）链接，加入下一次采集任务';
+    $('#syncUrl').placeholder='输入链动小铺店铺或商品链接，可单独同步整店';
+  }else{
+    $('#sourcePanelTitle').textContent='16688 平台公开商品采集';
+    $('#sourcePanelHint').textContent='已发现公开店铺的商品快照 · 从公开索引和商品链接发现多家店铺，再向 16688 原站采集。覆盖范围不代表全站完整数据。标价未含手续费，“万+付款”为公开销量下限。';
+    $('#crawlUrls').placeholder='可选：每行一个 16688 店铺或商品链接，加入下一次平台采集任务';
+    $('#syncUrl').placeholder='输入明确的商品或店铺链接，可单独同步整店';
+  }
+  $('#salesChartTitle').textContent=is16688?'店铺公开销量下限 Top10':'店铺销量 Top10';
+  $('#gType').innerHTML='<option value="">全部类型</option>'+(is16688?
     '<option value="auto">自动发货</option><option value="manual">手动发货</option><option value="unknown">未公开</option>':
     '<option value="card">卡密</option><option value="article">文章</option><option value="resource">资源</option><option value="equity">权益</option>');
-  const typeCols=local?[['auto_count','自动'],['manual_count','手动'],['unknown_count','未公开']]:[['card_count','卡密'],['equity_count','权益'],['resource_count','资源']];
+  const typeCols=is16688?[['auto_count','自动'],['manual_count','手动'],['unknown_count','未公开']]:[['card_count','卡密'],['equity_count','权益'],['resource_count','资源']];
   $$('#shopHead th').forEach((th,i)=>{if(i>=3&&i<=5){th.dataset.sort=typeCols[i-3][0];th.textContent=typeCols[i-3][1]}});
-  $('#shopHead th[data-sort="sell_count"]').textContent=local?'公开付款数':'销量';
-  $('#shopSort').innerHTML=(local?SHOP_SORT_OPTIONS.filter(([v])=>!['card_count','equity_count'].includes(v)).concat([['auto_count','按自动发货数'],['manual_count','按手动发货数']]):SHOP_SORT_OPTIONS).map(([v,l])=>`<option value="${v}">${l}</option>`).join('');
+  $('#shopHead th[data-sort="sell_count"]').textContent=is16688?'公开付款数':'销量';
+  $('#shopSort').innerHTML=(is16688?SHOP_SORT_OPTIONS.filter(([v])=>!['card_count','equity_count'].includes(v)).concat([['auto_count','按自动发货数'],['manual_count','按手动发货数']]):SHOP_SORT_OPTIONS).map(([v,l])=>`<option value="${v}">${l}</option>`).join('');
   $('#shopSort').value=shopQ.sort;
   clearTimeout(crawlTimer);
-  if(local) scheduleCrawlPoll(0);
+  if(crawlable) scheduleCrawlPoll(0);
 }
 async function switchSource(value){
   if(sending){$('#dataSource').value=dataSource;toast('请等待当前 AI 回复完成后切换数据源');return}
   dataSource=value;localStorage.setItem('wzyp_source',value);
   shopLoaded=false;goodsLoaded=false;chatInited=false;
+  crawlJob=null;crawlLastSnapshot='';$('#syncStatus').textContent='';
+  $('#crawlStatus').textContent='尚未开始平台采集。已有店铺快照仍可查询。';renderCrawl(null);
   threadId='t-'+Date.now().toString(36);threads=[];
   shopQ.sort='goods_count';shopQ.order='desc';goodsQ.sort='price';goodsQ.order='asc';
   ['shopKw','gKw','gMin','gMax'].forEach(id=>$('#'+id).value='');
@@ -561,11 +578,12 @@ async function switchSource(value){
 async function sync16688(){
   const button=$('#syncButton'), status=$('#syncStatus');
   if(button.disabled)return;
+  const targetSource=dataSource;
   singleSyncBusy=true;button.disabled=true;button.textContent='正在同步…';status.textContent='正在识别店铺并读取公开商品，请稍候…';
   try{
-    const result=await api('/api/sources/16688/sync',{url:$('#syncUrl').value.trim()});
+    const result=await api(crawlApiBase(targetSource)+'/sync',{url:$('#syncUrl').value.trim()});
     status.textContent=`已同步「${result.shop.nickname}」：${result.goods_count} 件商品、${result.detail_count} 条详情 · ${new Date(result.synced_at).toLocaleString('zh-CN')}`;
-    await switchSource('16688');toast('店铺数据已更新');
+    await switchSource(targetSource);toast('店铺数据已更新');
   }catch(e){status.textContent='同步失败：'+e.message;toast(e.message)}
   finally{singleSyncBusy=false;button.textContent='同步单个店铺';renderCrawl(crawlJob)}
 }
@@ -581,7 +599,7 @@ function renderCrawl(job){
   $('#resumeCrawlButton').hidden=!job||!['partial','failed','cancelled','interrupted'].includes(job.status);
   $('#resumeCrawlButton').disabled=busy;
   $('#crawlProgress').hidden=!job;
-  if(!job)return;
+  if(!job){$('#crawlStatus').textContent='尚未开始平台采集。已有店铺快照仍可查询。';return}
   const statuses={running:'采集中',cancelling:'正在取消，等待当前请求退出',cancelled:'已取消，可继续',interrupted:'已中断，可继续',completed:'本次采集完成',partial:'部分完成，可重试失败项',failed:'采集失败，可重试'};
   const phases={discovering:'发现公开入口',collecting:'逐店采集',finished:'已结束',interrupted:'已中断'};
   $('#crawlStatus').textContent=`${statuses[job.status]||job.status} · ${phases[job.phase]||job.phase}${job.phase==='discovering'?' · 已读取 '+job.discovery_pages+' 页索引':''} · 最近更新 ${new Date(job.updated_at).toLocaleString('zh-CN')}`;
@@ -591,9 +609,9 @@ function renderCrawl(job){
   $('#crawlErrorBox').hidden=!failures.length;
   $('#crawlFailures').textContent=failures.join('\n');
 }
-function scheduleCrawlPoll(delay=2000){clearTimeout(crawlTimer);if(dataSource==='16688')crawlTimer=setTimeout(pollCrawl,delay)}
+function scheduleCrawlPoll(delay=2000){clearTimeout(crawlTimer);if(isCrawlableSource())crawlTimer=setTimeout(pollCrawl,delay)}
 async function refreshCrawlViews(){
-  if(dataSource!=='16688')return;
+  if(!isCrawlableSource())return;
   shopLoaded=false;goodsLoaded=false;
   await loadDashboard();
   if($('#page-shops').classList.contains('active'))await loadShops(shopPage);
@@ -602,9 +620,10 @@ async function refreshCrawlViews(){
 async function pollCrawl(){
   if(crawlPolling){scheduleCrawlPoll();return}
   crawlPolling=true;
+  const pollSource=dataSource;
   try{
-    const {job}=await api('/api/sources/16688/crawl');
-    if(dataSource!=='16688')return;
+    const {job}=await api(crawlApiBase(pollSource)+'/crawl');
+    if(pollSource!==dataSource||!isCrawlableSource())return;
     renderCrawl(job);
     if(job){
       const snapshot=job.job_id+':'+job.success_shops;
@@ -612,7 +631,7 @@ async function pollCrawl(){
         crawlLastSnapshot=snapshot;crawlLastRefresh=Date.now();await refreshCrawlViews();
       }
     }
-  }catch(e){if(dataSource==='16688')$('#crawlStatus').textContent='暂时无法读取进度：'+e.message}
+  }catch(e){if(pollSource===dataSource&&isCrawlableSource())$('#crawlStatus').textContent='暂时无法读取进度：'+e.message}
   finally{crawlPolling=false;scheduleCrawlPoll()}
 }
 async function startCrawl(mode){
@@ -620,7 +639,7 @@ async function startCrawl(mode){
   crawlActionBusy=true;renderCrawl(crawlJob);
   try{
     const urls=$('#crawlUrls').value.split(/\r?\n/).map(v=>v.trim()).filter(Boolean);
-    renderCrawl(await api('/api/sources/16688/crawl',{mode,urls}));
+    renderCrawl(await api(crawlApiBase()+'/crawl',{mode,urls}));
     toast(crawlJob.reused?'已有任务正在采集，已显示当前进度':'已启动平台采集');scheduleCrawlPoll(0);
   }catch(e){toast(e.message)}
   finally{crawlActionBusy=false;renderCrawl(crawlJob)}
@@ -628,7 +647,7 @@ async function startCrawl(mode){
 async function changeCrawl(action){
   if(!crawlJob||crawlActionBusy)return;
   crawlActionBusy=true;renderCrawl(crawlJob);
-  try{renderCrawl(await api(`/api/sources/16688/crawl/${encodeURIComponent(crawlJob.job_id)}/${action}`,{}));scheduleCrawlPoll(0)}
+  try{renderCrawl(await api(`${crawlApiBase()}/crawl/${encodeURIComponent(crawlJob.job_id)}/${action}`,{}));scheduleCrawlPoll(0)}
   catch(e){toast(e.message)}
   finally{crawlActionBusy=false;renderCrawl(crawlJob)}
 }
@@ -972,6 +991,8 @@ async function openDetail(key){
       <span class="k">公开付款数</span><span>${esc(d.sales_count_text)||'未公开'}</span>
       <span class="k">可用库存</span><span>${fmt(d.stock_quantity)}</span>
       <span class="k">同步时间</span><span>${esc(d.synced_at)}</span>
+      <span class="k">原站</span><span><a class="shop-link" href="${esc(d.link)}" target="_blank" rel="noopener noreferrer">查看商品 ↗</a></span>`:dataSource==='wzyp-live'?`<span class="k">平台分类</span><span>${esc(d.category_name)||'未分类'}</span>
+      <span class="k">同步时间</span><span>${esc(d.synced_at)||'-'}</span>
       <span class="k">原站</span><span><a class="shop-link" href="${esc(d.link)}" target="_blank" rel="noopener noreferrer">查看商品 ↗</a></span>`:''}
     </div>
     <iframe class="desc-frame" id="descriptionFrame" title="商品描述" sandbox="" referrerpolicy="no-referrer"></iframe>`;
@@ -994,7 +1015,7 @@ function pager(sel,page,totalPages,size,total,fn){
 
 /* ================= 聊天 ================= */
 let chatInited=false, threadId='t-'+Date.now().toString(36), threads=[], sending=false;
-function threadsKey(){return dataSource==='wzyp'?'wzyp_threads':'wzyp_threads_16688'}
+function threadsKey(){return dataSource==='wzyp'?'wzyp_threads':'wzyp_threads_'+dataSource}
 function initChat(){
   threads=JSON.parse(localStorage.getItem(threadsKey())||'[]');
   if(!threads.length){threads=[{id:threadId,title:'新对话'}];localStorage.setItem(threadsKey(),JSON.stringify(threads))}
@@ -1199,12 +1220,23 @@ async function saveLlm(){
   await api('/api/llm/settings',{baseurl:$('#setBaseurl').value,model:$('#setModel').value,apikey:$('#setApikey').value});
   toast('LLM 配置已保存');refreshLlmBadge();
 }
+function formatLlmError(t){
+  const labels={
+    service_503:'服务不可用 (HTTP 503)',
+    auth_failed:'鉴权失败',
+    timeout:'请求超时',
+    connection_failed:'连接失败',
+    http_error:t.status_code?`请求错误 (HTTP ${t.status_code})`:'请求错误'
+  };
+  const tag=labels[t.error_type]||(t.status_code?`HTTP ${t.status_code}`:'连接异常');
+  return `❌ [${tag}] ${t.error||'未知错误'}`;
+}
 async function testLlm(){
   await api('/api/llm/settings',{baseurl:$('#setBaseurl').value,model:$('#setModel').value,apikey:$('#setApikey').value});
   const t=await api('/api/llm/test');
   const el=$('#testResult');
   el.className='test-result '+(t.ok?'ok':'bad');
-  el.textContent=t.ok?'✅ 连接成功：'+t.reply:'❌ '+t.error;
+  el.textContent=t.ok?'✅ 连接成功：'+t.reply:formatLlmError(t);
   refreshLlmBadge();
 }
 async function saveDb(){

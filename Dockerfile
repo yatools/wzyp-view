@@ -9,17 +9,21 @@ ENV TZ=Asia/Shanghai \
     PIP_NO_CACHE_DIR=1 \
     WZYP_HOST=0.0.0.0
 
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # 依赖（分层缓存）
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 应用代码
-COPY server.py agent.py db.py config.py run.py local_store.py platform16688.py ./
+COPY server.py agent.py db.py config.py run.py local_store.py platform16688.py platformwzyp.py ./
 COPY crawler16688.py crawl_store.py public_http.py ./
 COPY static/ ./static/
 
 # 数据目录（聊天记忆 / settings.json 运行时可写）
 RUN mkdir -p /app/data
+COPY data/wzyp_seeds.json /app/data/wzyp_seeds.json
 VOLUME ["/app/data"]
 
 EXPOSE 8770

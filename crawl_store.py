@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import local_store
-from platform16688 import BASE_URL, normalize_target
+import platform16688 as default_platform
 
 ACTIVE = ("running", "cancelling")
 
@@ -48,8 +48,14 @@ class JobConflict(Exception):
 
 
 class CrawlStore:
-    def __init__(self, path=None):
-        self.path = path or local_store.database_path()
+    def __init__(self, path=None, platform_adapter=None):
+        self.platform = platform_adapter or default_platform
+        if path:
+            self.path = path
+        elif hasattr(self.platform, "database_path"):
+            self.path = self.platform.database_path()
+        else:
+            self.path = local_store.database_path()
 
     @contextmanager
     def transaction(self):
@@ -76,11 +82,10 @@ class CrawlStore:
                                  "updated_at=?, error='服务已停止，点击继续采集可恢复' WHERE job_id=?",
                                  (timestamp(), row["job_id"]))
 
-    @staticmethod
-    def _enqueue(conn, job_id, urls, origin):
+    def _enqueue(self, conn, job_id, urls, origin):
         for value in urls:
             try:
-                target = normalize_target(value)
+                target = self.platform.normalize_target(value)
             except ValueError:
                 continue
             conn.execute("INSERT OR IGNORE INTO crawl_items "
@@ -130,7 +135,7 @@ class CrawlStore:
         return False
 
     def known_urls(self, include_discovered=False):
-        urls = {f"{BASE_URL}/shop/{row['token']}" for row in self.rows("SELECT token FROM wzyp_shops")}
+        urls = {f"{self.platform.BASE_URL}/shop/{row['token']}" for row in self.rows("SELECT token FROM wzyp_shops")}
         if include_discovered:
             urls.update(row["url"] for row in self.rows("SELECT DISTINCT url FROM crawl_items"))
         return sorted(urls)
@@ -145,10 +150,11 @@ class CrawlStore:
             conn.execute("UPDATE crawl_jobs SET discovery_version=?,discovery_pages=?,updated_at=?,heartbeat=? WHERE job_id=?",
                          (version, pages, timestamp(), time.time(), job_id))
 
-    def discovery_finished(self, job_id, urls=None, error=None):
+    def discovery_finished(self, job_id, urls=None, error=None, origin=None):
+        default_origin = getattr(self.platform, "DISCOVERY_ORIGIN", "pricemapai-public-index")
         with self.transaction() as conn:
             if urls is not None:
-                self._enqueue(conn, job_id, urls, "pricemapai-public-index")
+                self._enqueue(conn, job_id, urls, origin or default_origin)
             conn.execute("UPDATE crawl_jobs SET discovery_done=?,discovery_error=?,phase='collecting',updated_at=? WHERE job_id=?",
                          (int(error is None), error, timestamp(), job_id))
 
@@ -199,6 +205,9 @@ class CrawlStore:
             elif status == "failed" and shop_no:
                 conn.execute("UPDATE crawl_visits SET status='failed',error=? WHERE job_id=? AND shop_no=?",
                              (error, item["job_id"], shop_no))
+            elif status == "pending" and shop_no:
+                conn.execute("DELETE FROM crawl_visits WHERE job_id=? AND shop_no=? AND status!='done'",
+                             (item["job_id"], shop_no))
             conn.execute("UPDATE crawl_jobs SET updated_at=? WHERE job_id=?", (timestamp(), item["job_id"]))
 
     def cancel(self, job_id):

@@ -8,7 +8,8 @@ __pycache__/
 *.pyo
 
 # 运行时数据（由 volume 挂载，不打进镜像）
-data/
+data/*
+!data/wzyp_seeds.json
 settings.json
 server.log
 *.log
