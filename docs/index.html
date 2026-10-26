@@ -294,14 +294,14 @@ footer .fine{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);f
   </div>
 </section>
 
-<!-- ======= 真实快照数据条 ======= -->
+<!-- ======= 采集能力 ======= -->
 <div class="stats">
   <div class="wrap" style="max-width:none;padding:0">
     <div class="grid">
-      <div class="cell"><div class="label">收录店铺</div><div class="value num">250<em>家</em></div></div>
-      <div class="cell"><div class="label">在售商品</div><div class="value num">11,042<em>件</em></div></div>
-      <div class="cell"><div class="label">商品详情全文</div><div class="value num">10,769<em>条</em></div></div>
-      <div class="cell"><div class="label">全网总销量</div><div class="value num">3,565,665</div></div>
+      <div class="cell"><div class="label">采集平台</div><div class="value num">2<em>个</em></div></div>
+      <div class="cell"><div class="label">链动种子入口</div><div class="value num">250<em>家</em></div></div>
+      <div class="cell"><div class="label">商品来源</div><div class="value">原站采集</div></div>
+      <div class="cell"><div class="label">本地存储</div><div class="value">SQLite</div></div>
     </div>
   </div>
 </div>
@@ -314,7 +314,7 @@ footer .fine{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);f
       <h2>每一块图表，<br>都是一次下钻的入口</h2>
       <p>
         统计卡、商品类型分布、价格区间、热词云、销量 Top10 —— 没有一块图表是摆设。
-        点「卡密 9,600」立刻看到这 9,600 件商品；点热词「质保」直接跳到筛选结果。
+        点商品类型卡片查看对应商品；点热词「质保」直接跳到筛选结果。截图为历史示例，实际数量以本地采集结果为准。
       </p>
       <div class="chips">
         <span class="chip on"><span class="tick">✓</span> 点击下钻到筛选结果</span>
@@ -395,20 +395,20 @@ footer .fine{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);f
   <div class="wrap f-grid">
     <div class="f-copy reveal">
       <div class="kicker">页面化配置</div>
-      <h2>改配置不碰文件，<br>测连通过才让保存</h2>
+      <h2>数据自动落盘，<br>AI 接口页面配置</h2>
       <p>
-        MySQL 与任意 OpenAI 兼容 LLM（DeepSeek / 智谱 / 本地 vLLM / Ollama…）全部在网页设置页配置：
-        保存前自动测试连接，改完热生效，配置支持一键导入 / 导出，重启不丢。
+        两个平台的采集数据各自保存在本地 SQLite，无需安装数据库服务。
+        任意 OpenAI 兼容 LLM 可在网页设置页配置并测试连接；保存后热生效，支持一键导入 / 导出。
       </p>
       <div class="chips">
-        <span class="chip on"><span class="tick">✓</span> 保存前测连</span>
+        <span class="chip on"><span class="tick">✓</span> 接口连通测试</span>
         <span class="chip on"><span class="tick">✓</span> 配置热生效</span>
         <span class="chip on"><span class="tick">✓</span> 导入 / 导出</span>
         <span class="chip on"><span class="tick">✓</span> 环境变量优先级更高</span>
       </div>
     </div>
     <div class="f-shot reveal">
-      <img src="screenshot-settings.png" alt="设置页：数据库与 LLM 页面化配置" loading="lazy">
+      <img src="screenshot-settings.png" alt="旧版设置页示意；当前版本仅需配置 LLM" loading="lazy">
     </div>
   </div>
 </section>
@@ -431,8 +431,8 @@ footer .fine{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);f
       </div>
       <div class="arrow">→</div>
       <div class="node db">
-        <h3><span class="ico">🗄️</span>MySQL</h3>
-        <p>shops / goods / goods_detail 三表，连接池 + 配置热重建，SSE 推流到前端。</p>
+        <h3><span class="ico">🗄️</span>SQLite</h3>
+        <p>两个平台独立保存采集快照，查询仅允许读取业务表，SSE 推流到前端。</p>
       </div>
     </div>
     <div class="guard reveal">
@@ -452,16 +452,11 @@ footer .fine{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);f
     <div class="cols">
       <div class="qcard reveal">
         <div class="qhead"><span class="n">A</span><b>本地运行（uv）</b><span class="tag">推荐</span></div>
-        <pre><span class="c"># 1. 从 Releases 下载 wzyp-data.zip，导入 MySQL</span>
-mysql -u root -p wzyp &lt; wzyp_shops.sql
-mysql -u root -p wzyp &lt; wzyp_goods.sql
-mysql -u root -p wzyp &lt; wzyp_goods_detail.sql
-
-<span class="c"># 2. 建环境、装依赖（Python ≥ 3.11）</span>
+        <pre><span class="c"># 1. 建环境、装依赖（Python ≥ 3.11，需 curl）</span>
 <span class="p">uv</span> venv --python 3.13
 <span class="p">uv</span> pip install -r requirements.txt
 
-<span class="c"># 3. 启动</span>
+<span class="c"># 2. 启动后选择平台并采集</span>
 <span class="p">python</span> run.py   <span class="c"># → http://127.0.0.1:8770</span></pre>
       </div>
       <div class="qcard reveal">
@@ -478,7 +473,7 @@ cd wzyp-view
       </div>
     </div>
     <p style="margin-top:22px;font-size:14px;color:var(--sub)">
-      打开页面后先进「⚙️ 设置」：填好 MySQL 点「测试连接」，再填任意 OpenAI 兼容接口的 Base URL / Model / API Key，保存即用。
+      打开页面后选择「链动小铺」或「16688 交易平台」采集商品；如需 AI 分析，再到设置页配置 LLM。历史备份仅提供店铺入口，商品和价格须重新采集成功后才展示。
     </p>
   </div>
 </section>
@@ -499,7 +494,7 @@ cd wzyp-view
     </div>
     <div class="fine">
       <span>MIT License</span>
-      <span>数据采集自公开接口（2026-09 快照），仅供学习研究，请勿用于商业用途</span>
+      <span>数据来自已成功采集的公开接口；页面截图为历史示例，不代表当前采集数量或全站覆盖</span>
     </div>
   </div>
 </footer>

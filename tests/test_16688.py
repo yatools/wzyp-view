@@ -197,7 +197,7 @@ class SnapshotTests(unittest.TestCase):
     def test_api_routes_validation_and_source_isolation(self):
         self.sync()
         client = TestClient(server.app)
-        with patch.object(db, "_build_pool", side_effect=AssertionError("不应连接 MySQL")):
+        with patch.dict("sys.modules", {"pymysql": None, "dbutils": None}):
             self.assertEqual(client.get("/api/health").status_code, 200)
             self.assertEqual(client.get("/api/sources").status_code, 200)
             self.assertEqual(client.get("/api/stats?source=16688").json()["stats"]["goods_count"], 2)
@@ -242,7 +242,7 @@ class SnapshotTests(unittest.TestCase):
         with patch.object(agent, "build_llm", return_value=model), \
              patch.object(agent, "suggest_followups", return_value=[]), \
              patch.object(agent, "memory_store", agent.MemoryStore(os.path.join(self.temp.name, "memory.json"))), \
-             patch.object(db, "_build_pool", side_effect=AssertionError("AI 不应连接 MySQL")):
+             patch.dict("sys.modules", {"pymysql": None, "dbutils": None}):
             response = TestClient(server.app).post("/api/chat?source=16688", json={"thread_id": "same", "message": "有多少商品"})
             self.assertEqual(response.status_code, 200)
             self.assertNotIn('"event": "error"', response.text)

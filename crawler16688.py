@@ -3,6 +3,9 @@ import gzip
 import io
 import json
 import re
+import sqlite3
+from sqlite_init import is_busy
+from task_lifecycle import run_worker
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
@@ -12,6 +15,7 @@ import requests
 import platform16688 as platform
 from crawl_store import ACTIVE, CrawlStore
 from public_http import CrawlBlockedError, CrawlCancelled, PublicSession
+from crawl_failure import from_exception
 
 INDEX_ORIGIN = "https://pricemapai.com"
 INDEX_MANIFEST = f"{INDEX_ORIGIN}/data/latest.json"
@@ -35,7 +39,7 @@ def read_index_json(session, url):
         raise platform.PlatformError("公开索引暂时不可读取，已保留现有快照") from exc
 
 
-def discover_public(session, progress=None):
+def discover_public(session, progress=None, all_platforms=False):
     """版本不一致时从新清单重试一次；完整校验前不提交发现的链接。"""
     last_error = None
     for _ in range(2):
@@ -75,7 +79,11 @@ def discover_public(session, progress=None):
                     for url in (base_url, offer.get("purchase_url")):
                         if isinstance(url, str):
                             try:
-                                urls.add(platform.normalize_target(url)["url"])
+                                if all_platforms:
+                                    from shop_http import normalize_url
+                                    urls.add(normalize_url(url))
+                                else:
+                                    urls.add(platform.normalize_target(url)["url"])
                             except ValueError:
                                 pass
                 if progress:
@@ -88,9 +96,15 @@ def discover_public(session, progress=None):
     raise platform.PlatformError(last_error or "公开索引发现失败")
 
 
+def discover_public_links(session, progress=None):
+    """共享清单完整性校验，跨平台任务只提取链接，不导入第三方报价。"""
+    return discover_public(session, progress, all_platforms=True)
+
+
 class CrawlManager:
-    def __init__(self, path=None, session_factory=None, discover=None, platform_adapter=None):
+    def __init__(self, path=None, session_factory=None, discover=None, platform_adapter=None, workflow_version=2):
         self.platform = platform_adapter or platform
+        self.workflow_version = workflow_version
         self.store = CrawlStore(path, platform_adapter=self.platform)
         if session_factory is not None:
             self.session_factory = session_factory
@@ -98,29 +112,37 @@ class CrawlManager:
             self.session_factory = self.platform.session_factory
         else:
             self.session_factory = lambda stop: PublicSession(stop=stop)
+        self.index_session_factory = (self.session_factory if session_factory is not None else
+                                      getattr(self.platform, "index_session_factory", self.session_factory))
         if discover is not None:
             self.discover = discover
         elif hasattr(self.platform, "discover_public"):
             self.discover = self.platform.discover_public
         else:
             self.discover = discover_public
+        self.seed_urls = getattr(self.platform, "seed_urls", lambda: []) if discover is None else lambda: []
         self.lock = threading.Lock()
         self.thread = None
         self.job_id = None
         self.stop = None
         self.shutting_down = None
         self.block_error = None
+        self.block_failure = None
 
     def recover_interrupted(self):
         self.store.recover()
 
-    def _launch(self, job_id):
+    def _launch(self, job_id, transport_scope=None):
         self.job_id = job_id
         self.stop = threading.Event()
+        from hosted_http import TransportScope
+        self.stop.transport_scope = transport_scope or TransportScope()
+        self.stop.owns_transport_scope = transport_scope is None
         self.shutting_down = threading.Event()
         self.block_error = None
+        self.block_failure = None
         prefix = getattr(self.platform, "SOURCE_KEY", "16688")
-        self.thread = threading.Thread(target=self._run, args=(job_id, self.stop, self.shutting_down),
+        self.thread = threading.Thread(target=run_worker,args=('crawl',self.store.path,job_id,self._run,(job_id,self.stop,self.shutting_down)),
                                        name=f"{prefix}-crawl", daemon=True)
         try:
             self.thread.start()
@@ -128,36 +150,75 @@ class CrawlManager:
             self.store.finish_job(job_id, "failed", "无法启动采集线程")
             raise
 
-    def start(self, mode="discover", urls=None):
-        if mode not in {"discover", "refresh"}:
-            raise ValueError("mode 应为 discover 或 refresh")
+    def start(self, mode="discover", urls=None, reuse=True, discovery_owner=None, transport_scope=None):
+        if mode not in {"discover", "refresh", "targets"}:
+            raise ValueError("mode 应为 discover、refresh 或 targets")
         urls = [self.platform.normalize_target(url)["url"] for url in (urls or [])]
         with self.lock:
             self.recover_interrupted()
-            job_id, reused = self.store.create(mode, urls)
+            job_id, reused = self.store.create(mode, urls, reuse=reuse, discovery_owner=discovery_owner,
+                                               workflow_version=self.workflow_version)
             if not reused:
-                self._launch(job_id)
+                self._launch(job_id, transport_scope)
         return {**self.store.report(job_id), "reused": reused}
 
-    def resume(self, job_id):
+    def resume(self, job_id, transport_scope=None, retry_mode="transient"):
         with self.lock:
             self.recover_interrupted()
-            reused = self.store.resume(job_id)
+            reused = self.store.resume(job_id, retry_mode)
             if not reused:
-                self._launch(job_id)
+                self._launch(job_id, transport_scope)
         return {**self.store.report(job_id), "reused": reused}
 
-    def cancel(self, job_id):
-        self.store.cancel(job_id)
-        if job_id == self.job_id and self.stop:
-            self.stop.set()
+    def cancel(self, job_id, interrupt=False):
+        with self.lock:
+            self.store.cancel(job_id)
+            if job_id == self.job_id and self.stop:
+                if interrupt:
+                    self.shutting_down.set()
+                self.stop.set()
         return self.store.report(job_id)
+
+    def wait_for_job(self, job_id):
+        with self.lock:
+            thread = self.thread if self.job_id == job_id else None
+        if thread:
+            thread.join()
 
     def shutdown(self):
         if self.thread and self.thread.is_alive():
             self.shutting_down.set()
             self.stop.set()
             self.thread.join(timeout=2)
+
+    def shop_entry_url(self,key,url):
+        if not key:return url
+        if hasattr(self.platform,'shop_url'):return self.platform.shop_url(key,url)
+        return f'{self.platform.BASE_URL}/shop/{key}'
+
+    def _probe_process(self, item, stop):
+        from shop_preview import PreviewStore
+        from sources import canonical_source
+        source=canonical_source(getattr(self.platform,'SOURCE_NAME',self.platform.SOURCE_KEY))
+        previews=PreviewStore()
+        try:
+            if stop.is_set(): raise CrawlCancelled()
+            key=self.store.lookup_shop(item['kind'],item['target'])
+            previous=previews.get(item['job_id'],source,key) if key else None
+            if previous:
+                self.store.finish_preview(item,key,previous['eligibility']=='eligible' and previous['collection_state']!='collected')
+                return
+            with self.session_factory(stop) as session:
+                preview=self.platform.probe_shop(self.shop_entry_url(key,item['url']),session)
+            if stop.is_set(): raise CrawlCancelled()
+            data=preview.normalized()
+            previews.save(item['job_id'],source,data)
+            self.store.remember(item,{'shop_no':data['shop_key']},goods=data['products'])
+            self.store.finish_preview(item,data['shop_key'],data['eligibility']=='eligible')
+        except CrawlCancelled:
+            self.store.finish_item(item,'pending')
+        except Exception as exc:
+            self._record_failure(item,None,exc,stop)
 
     def _process(self, item, stop):
         shop_no, claimed = None, False
@@ -171,7 +232,7 @@ class CrawlManager:
                     if not claimed:
                         self.store.finish_item(item, "skipped", shop_no)
                         return
-                url = f"{self.platform.BASE_URL}/shop/{shop_no}" if shop_no else item["url"]
+                url = self.shop_entry_url(shop_no,item['url'])
                 resolved = self.platform.resolve_target(url, session)
                 shop = resolved[0]
                 if shop_no and shop_no != shop["shop_no"]:
@@ -185,16 +246,35 @@ class CrawlManager:
                         return
                 result = self.platform.sync_shop(url, session=session, resolved=resolved, store_path=self.store.path)
                 self.store.finish_item(item, "done", shop_no, result=result)
+                if self.store.rows('SELECT workflow_version FROM crawl_jobs WHERE job_id=?',(item['job_id'],))[0]['workflow_version']==2:
+                    from shop_preview import PreviewStore
+                    from sources import canonical_source
+                    source=canonical_source(getattr(self.platform,'SOURCE_NAME',self.platform.SOURCE_KEY))
+                    PreviewStore().collection(item['job_id'],source,shop_no,'collected')
         except CrawlBlockedError as exc:
-            self.block_error = str(exc)[:400]
-            if self.shutting_down:
-                self.shutting_down.set()
-            stop.set()
-            self.store.finish_item(item, "pending", shop_no if claimed else None)
+            self._record_failure(item, shop_no if claimed else None, exc, stop)
         except CrawlCancelled:
             self.store.finish_item(item, "pending", shop_no if claimed else None)
         except Exception as exc:
-            self.store.finish_item(item, "failed", shop_no if claimed else None, str(exc)[:400])
+            self._record_failure(item, shop_no if claimed else None, exc, stop)
+
+    def _record_failure(self, item, shop_no, exc, stop):
+        failure = from_exception(exc)
+        if failure["pause_origin"] and not getattr(self.platform, "MULTI_ORIGIN", False):
+            self.block_error, self.block_failure = str(exc)[:400], failure
+            if self.shutting_down:
+                self.shutting_down.set()
+            stop.set()
+            self.store.finish_item(item, "pending", shop_no, failure=failure)
+        else:
+            self.store.finish_item(item, "failed", shop_no, str(exc)[:400], failure=failure)
+
+    def _read_index(self, job_id, stop):
+        def progress(version, pages):
+            if not stop.is_set():
+                self.store.discovery_progress(job_id, version, pages)
+        with self.index_session_factory(stop) as session:
+            return self.discover(session, progress)
 
     def _run(self, job_id, stop, shutting_down):
         pulse_done = threading.Event()
@@ -202,62 +282,95 @@ class CrawlManager:
 
         def pulse():
             while not pulse_done.wait(1):
-                if self.store.heartbeat(job_id):
-                    stop.set()
+                try:
+                    if self.store.heartbeat(job_id):stop.set()
+                except sqlite3.OperationalError as error:
+                    if not is_busy(error):raise
 
         heartbeat_thread = threading.Thread(target=pulse, daemon=True, name=f"{prefix}-heartbeat")
         heartbeat_thread.start()
+        terminal, error, failure = "failed", None, None
         try:
             job = self.store.report(job_id)
-            self.store.enqueue(job_id, self.store.known_urls(job["mode"] == "discover"), "known")
-            if job["mode"] == "discover" and not job["discovery_done"]:
-                try:
-                    with self.session_factory(stop) as session:
-                        urls = self.discover(session, lambda version, pages: self.store.discovery_progress(job_id, version, pages))
-                    self.store.discovery_finished(job_id, urls)
-                except CrawlBlockedError as exc:
-                    self.block_error = str(exc)[:400]
-                    shutting_down.set()
-                    stop.set()
-                except self.platform.PlatformError as exc:
-                    self.store.discovery_finished(job_id, error=str(exc)[:400])
-            if job["mode"] == "refresh":
+            staged=job.get('workflow_version')==2
+            discovering=staged and job['phase']=='shop_discovery'
+            if job["mode"] != "targets" and (not staged or discovering):
+                self.store.enqueue(job_id, self.store.known_urls(job["mode"] == "discover"), "known")
+                if job["mode"] == "discover":
+                    self.store.enqueue(job_id, self.seed_urls(), "local-seeds")
+                    if staged:
+                        from shop_preview import PreviewStore
+                        from sources import canonical_source
+                        source=canonical_source(getattr(self.platform,'SOURCE_NAME',self.platform.SOURCE_KEY))
+                        self.store.enqueue(job_id,PreviewStore().known_urls(source),'saved-directory')
+            if job["mode"] in {"refresh", "targets"}:
                 self.store.discovery_finished(job_id, [])
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{prefix}-shop") as pool:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{prefix}-index") as indexes, \
+                    ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{prefix}-shop") as pool:
+                index = (indexes.submit(self._read_index, job_id, stop)
+                         if job["mode"] == "discover" and not job["discovery_done"] and (not staged or discovering) else None)
                 futures = set()
                 while True:
                     if self.store.heartbeat(job_id):
                         stop.set()
+                    if index is not None and index.done():
+                        try:
+                            urls = index.result()
+                            if not stop.is_set():
+                                self.store.discovery_finished(job_id, urls)
+                        except CrawlCancelled:
+                            if not stop.is_set():
+                                raise
+                        except Exception as exc:
+                            if not stop.is_set():
+                                self.store.discovery_finished(job_id, error=str(exc)[:400])
+                        index = None
                     while not stop.is_set() and len(futures) < 2:
                         item = self.store.claim_item(job_id)
                         if item is None:
                             break
-                        futures.add(pool.submit(self._process, item, stop))
-                    if not futures:
+                        futures.add(pool.submit(self._probe_process if discovering else self._process, item, stop))
+                    if not futures and (index is None or stop.is_set()):
+                        if discovering and not stop.is_set():
+                            with self.store.transaction() as conn:
+                                cancelled=conn.execute('SELECT cancel_requested FROM crawl_jobs WHERE job_id=?',(job_id,)).fetchone()[0]
+                                if cancelled:
+                                    stop.set()
+                                else:
+                                    conn.execute("UPDATE crawl_jobs SET phase='goods_collection' WHERE job_id=?",(job_id,))
+                                    conn.execute("UPDATE crawl_items SET status='pending' WHERE job_id=? AND status='previewed'",(job_id,))
+                            if not stop.is_set():
+                                discovering=False
+                                continue
                         break
-                    done, futures = wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
-                    for future in done:
-                        future.result()
+                    if futures:
+                        done, futures = wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            future.result()
+                    else:
+                        stop.wait(0.1)
             report = self.store.report(job_id)
             if self.block_error:
-                self.store.finish_job(job_id, "interrupted", self.block_error)
+                terminal, error, failure = "interrupted", self.block_error, self.block_failure
             elif stop.is_set():
-                status = "interrupted" if shutting_down.is_set() else "cancelled"
-                self.store.finish_job(job_id, status)
+                terminal = "interrupted" if shutting_down.is_set() else "cancelled"
             elif report["failure_count"] or report["discovery_error"]:
-                status = "partial" if report["success_shops"] else "failed"
-                self.store.finish_job(job_id, status)
+                terminal = "partial" if report["success_shops"] else "failed"
             else:
-                self.store.finish_job(job_id, "completed")
+                terminal = "completed"
         except CrawlBlockedError as exc:
-            self.store.finish_job(job_id, "interrupted", str(exc)[:400])
+            terminal, error, failure = "interrupted", str(exc)[:400], exc.failure
         except CrawlCancelled:
-            self.store.finish_job(job_id, "interrupted" if shutting_down.is_set() else "cancelled")
+            terminal = "interrupted" if shutting_down.is_set() else "cancelled"
         except Exception as exc:
-            self.store.finish_job(job_id, "failed", str(exc)[:400])
+            terminal, error, failure = "failed", str(exc)[:400], from_exception(exc)
         finally:
+            stop.set()
             pulse_done.set()
             heartbeat_thread.join(timeout=2)
+            if getattr(stop, "owns_transport_scope", False):
+                stop.transport_scope.close()
+            self.store.finish_job(job_id, terminal, error, failure=failure)
 
 
 def run_cli(mode, urls, resume, platform_adapter=None):

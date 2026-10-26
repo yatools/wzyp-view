@@ -14,11 +14,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 
 # 依赖（分层缓存）
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -m playwright install --with-deps chromium
 
 # 应用代码
 COPY server.py agent.py db.py config.py run.py local_store.py platform16688.py platformwzyp.py ./
-COPY crawler16688.py crawl_store.py public_http.py ./
+COPY crawler16688.py crawl_store.py crawl_failure.py public_http.py ./
+COPY shop_preview.py sqlite_init.py task_lifecycle.py ./
+COPY hosted_shop.py hosted_http.py browser_transport.py yike.py yike_crawler.py ./
+COPY sources.py shop_http.py link_discovery.py platform_independent.py catalog.py discovery.py api_multisource.py ./
 COPY static/ ./static/
 
 # 数据目录（聊天记忆 / settings.json 运行时可写）

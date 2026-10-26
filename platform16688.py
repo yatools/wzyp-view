@@ -12,12 +12,21 @@ import local_store
 from public_http import PublicSession
 
 BASE_URL = "https://www.16688.com.cn"
+SOURCE_KEY = "16688"
+SOURCE_NAME = "16688"
 EXAMPLE_URL = f"{BASE_URL}/goods/G74884541"
 ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 
 
-class PlatformError(Exception):
-    pass
+from crawl_failure import CollectionError as PlatformError, business, from_exception
+
+
+def session_factory(stop=None):
+    from hosted_http import HostedSession
+    return HostedSession(BASE_URL, stop=stop)
+
+
+index_session_factory = lambda stop=None: PublicSession(stop=stop)
 
 
 def parse_target(url):
@@ -108,14 +117,16 @@ def fetch_public(session, endpoint, payload):
             raise PlatformError("平台响应跳转或体积异常，请稍后重试")
         body = response.json()
     except (requests.RequestException, ValueError) as exc:
-        raise PlatformError("16688 公开接口访问失败，请检查网络后重试") from exc
+        raise PlatformError("16688 公开接口访问失败，请检查网络后重试", failure=from_exception(exc)) from exc
     if not isinstance(body, dict) or body.get("code") != 1 or "data" not in body:
         message = body.get("msg", "响应格式无效") if isinstance(body, dict) else "响应格式无效"
-        raise PlatformError(f"16688：{str(message)[:160]}")
+        raise PlatformError(f"16688：{str(message)[:160]}", failure=business(message))
     return body["data"]
 
 
 def resolve_target(url, session):
+    if hasattr(session, "set_entry_url"):
+        session.set_entry_url(normalize_target(url)["url"])
     kind, target = parse_target(url)
     seed = None
     if kind == "goods":
@@ -132,10 +143,16 @@ def resolve_target(url, session):
     return shop, seed
 
 
+def probe_shop(url, session, resolved=None):
+    import sys
+    from shop_preview import probe_16688
+    return probe_16688(sys.modules[__name__], url, session, resolved)
+
+
 def sync_shop(url, session=None, resolved=None, store_path=None):
     parse_target(url)
     own_session = session is None
-    session = session or PublicSession()
+    session = session or session_factory()
     try:
         session.headers.update({"User-Agent": "wzyp-view/16688-public-reader", "Accept": "application/json"})
         shop, seed = resolved or resolve_target(url, session)
@@ -151,7 +168,7 @@ def sync_shop(url, session=None, resolved=None, store_path=None):
         if listing.get("has_more") or (listing.get("total") is not None and _number(listing["total"]) != len(rows)):
             raise PlatformError("平台列表已变为分页返回，未更新本地快照")
         if seed and not any(isinstance(row, dict) and row.get("goods_no") == seed["goods_no"] for row in rows):
-            raise PlatformError("入口商品未出现在完整店铺列表中，请稍后重试")
+            raise PlatformError("入口商品未出现在完整店铺列表中，请稍后重试", "snapshot_changed")
         categories = fetch_public(session, "goods_category/list", {"shop_no": shop_no})
         if not isinstance(categories, list) or any(not isinstance(c, dict) for c in categories):
             raise PlatformError("平台商品分类格式异常")
@@ -163,7 +180,7 @@ def sync_shop(url, session=None, resolved=None, store_path=None):
                 raise PlatformError("平台返回了无效商品，未更新本地快照")
             key = _identifier(item.get("goods_no"))
             if key in seen:
-                raise PlatformError("平台商品列表出现重复编号，未更新本地快照")
+                raise PlatformError("平台商品列表出现重复编号，未更新本地快照", "snapshot_changed")
             seen.add(key)
             # 平台前端定义：1、2 为自动发货，3 为人工发货。
             goods_type = {1: "auto", 2: "auto", 3: "manual", "1": "auto", "2": "auto", "3": "manual"}.get(item.get("delivery_method"), "unknown")

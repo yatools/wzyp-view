@@ -178,7 +178,7 @@ class CrawlerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.temp.name, "crawl.sqlite3")
-        self.env = patch.dict(os.environ, {"WZYP_16688_DB": self.path})
+        self.env = patch.dict(os.environ, {"WZYP_16688_DB": self.path,"WZYP_DISCOVERY_DB": os.path.join(self.temp.name,"discovery.sqlite3")})
         self.env.start()
         self.network = NetworkModel()
         self.discoveries = 0
@@ -188,7 +188,7 @@ class CrawlerTests(unittest.TestCase):
             progress(VERSION, 2)
             return discover_public(IndexSession(index_routes()))
 
-        self.manager = CrawlManager(self.path, self.network.factory, discover)
+        self.manager = CrawlManager(self.path, self.network.factory, discover, workflow_version=1) # legacy checkpoint coverage
 
     def tearDown(self):
         self.network.release.set()

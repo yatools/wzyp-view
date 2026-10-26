@@ -18,8 +18,9 @@ from crawler16688 import CrawlManager
 from crawl_store import JobConflict
 from config import BASE_DIR
 from public_http import CrawlBlockedError
+from sources import SOURCES, Source
+from api_multisource import build_router, SourceResumeBody
 
-Source = Literal["wzyp", "wzyp-live", "16688"]
 crawler = CrawlManager()
 wzyp_crawler = CrawlManager(platform_adapter=platformwzyp)
 
@@ -28,11 +29,15 @@ wzyp_crawler = CrawlManager(platform_adapter=platformwzyp)
 async def lifespan(app):
     crawler.recover_interrupted()
     wzyp_crawler.recover_interrupted()
+    multisource_runtime.recover()
     try:
         yield
     finally:
+        multisource_runtime.shutdown()
         crawler.shutdown()
         wzyp_crawler.shutdown()
+        from browser_transport import shutdown_browser
+        shutdown_browser()
         agent_mod = sys.modules.get("agent")
         if agent_mod and hasattr(agent_mod, "close_http_clients"):
             agent_mod.close_http_clients()
@@ -75,9 +80,11 @@ def health():
 
 @app.get("/api/sources")
 def sources():
-    return {"sources": [{"id": "wzyp", "name": "链动小铺", "storage": "MySQL"},
-                        {"id": "wzyp-live", "name": "链动小铺（最新采集）", "storage": "SQLite"},
-                        {"id": "16688", "name": "16688 交易平台", "storage": "SQLite"}],
+    return {"sources": [{"id": key, "name": name, "storage": "SQLite",
+                         "kind": "aggregator" if key == "yike" else "direct",
+                         "family": "hosted" if key in {"wzyp-live", "catfk"} else "other",
+                         "discovery": key != "yike", "keyword_crawl": key == "yike"}
+                        for key, name in SOURCES.items()],
             "example_url": platform16688.EXAMPLE_URL,
             "wzyp_example_url": platformwzyp.EXAMPLE_URL}
 
@@ -107,7 +114,7 @@ def sync_wzyp(body: SyncRequest):
 
 
 class CrawlRequest(BaseModel):
-    mode: Literal["discover", "refresh"] = "discover"
+    mode: Literal["discover", "refresh", "targets"] = "discover"
     urls: list[str] = Field(default_factory=list, max_length=1000)
 
 
@@ -143,9 +150,9 @@ def cancel_crawl(job_id: str):
 
 
 @app.post("/api/sources/16688/crawl/{job_id}/resume")
-def resume_crawl(job_id: str):
+def resume_crawl(job_id: str, body: SourceResumeBody | None = None):
     try:
-        return crawler.resume(job_id)
+        return crawler.resume(job_id, retry_mode=(body or SourceResumeBody()).retry_mode)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="采集任务不存在") from exc
     except JobConflict as exc:
@@ -184,9 +191,9 @@ def cancel_wzyp_crawl(job_id: str):
 
 
 @app.post("/api/sources/wzyp/crawl/{job_id}/resume")
-def resume_wzyp_crawl(job_id: str):
+def resume_wzyp_crawl(job_id: str, body: SourceResumeBody | None = None):
     try:
-        return wzyp_crawler.resume(job_id)
+        return wzyp_crawler.resume(job_id, retry_mode=(body or SourceResumeBody()).retry_mode)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="采集任务不存在") from exc
     except JobConflict as exc:
@@ -225,6 +232,7 @@ class GoodsQuery(BaseModel):
     shop_token: str | None = None
     goods_type: str | None = None
     kw: str | None = None
+    keywords: list[str] = Field(default_factory=list)
     price_min: float | None = None
     price_max: float | None = None
     filters: list[FilterSpec] | None = None
@@ -251,7 +259,7 @@ def api_goods_detail(goods_key: str, source: Source = "wzyp"):
         return db.goods_detail(goods_key) or {}
 
 
-# ---------------- 设置 API（LLM + DB + 导入导出）----------------
+# ---------------- 设置 API（LLM + 导入导出）----------------
 
 @app.get("/api/llm/settings")
 def get_settings():
@@ -292,74 +300,21 @@ def test_llm():
                 "status_code": info["status_code"]}
 
 
-# ---- 数据库配置 ----
+# ---- 旧数据库配置接口保留明确的停用响应 ----
 
 @app.get("/api/db/settings")
-def get_db_settings():
-    c = cfg.get_db_config()
-    return {"host": c["host"], "port": c["port"], "user": c["user"],
-            "database": c["database"],
-            "password": (c.get("password") or "")[:4] + "..." if c.get("password") else "",
-            "has_password": bool(c.get("password"))}
-
-
-class DBSettings(BaseModel):
-    host: str = ""
-    port: int = 0
-    user: str = ""
-    password: str = ""
-    database: str = ""
-
-
 @app.post("/api/db/settings")
-def save_db_settings(body: DBSettings):
-    current = cfg.get_db_config()
-    new_cfg = {
-        "host": body.host or current["host"],
-        "port": body.port or current["port"],
-        "user": body.user or current["user"],
-        "database": body.database or current["database"],
-        "password": body.password if body.password and not body.password.endswith("...") else current.get("password", ""),
-    }
-    # 先测试新配置可用再保存
-    try:
-        import pymysql as _pym
-        conn = _pym.connect(charset="utf8mb4", connect_timeout=8,
-                            read_timeout=10, **{**new_cfg, "password": new_cfg["password"]})
-        conn.close()
-    except Exception as e:
-        return {"ok": False, "error": f"连接失败: {str(e)[:150]}"}
-    cfg.save_settings(db=new_cfg)
-    db.rebuild_pool()
-    return {"ok": True}
-
-
 @app.get("/api/db/test")
-def test_db():
-    """DB 连通性测试"""
-    try:
-        rows = db.query("SELECT COUNT(*) AS shops FROM wzyp_shops")
-        return {"ok": True, "shops": rows[0]["shops"]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
+def database_settings_removed():
+    raise HTTPException(status_code=410, detail="已统一使用本地采集数据库，无需配置 MySQL。请使用「链动小铺」采集功能。")
 
 
 # ---- 配置导入导出 ----
 
 @app.get("/api/config/export")
 def config_export():
-    """导出全部配置为 JSON（含明文密钥，仅本机使用）"""
-    import json as _json
-    data = cfg.load_settings()
-    # settings.json 的原始内容即完整配置
-    try:
-        with open(cfg.SETTINGS_FILE, encoding="utf-8") as f:
-            raw = _json.load(f)
-        if "llm" in raw or "db" in raw:
-            data = raw
-    except Exception:
-        pass
-    return data
+    """导出 LLM 配置为 JSON（含明文密钥，仅本机使用）。"""
+    return cfg.load_settings()
 
 
 class ConfigImport(BaseModel):
@@ -371,25 +326,13 @@ def config_import(body: ConfigImport):
     """导入配置 JSON（结构同导出）"""
     c = body.config or {}
     llm = c.get("llm") or {}
-    dbc = c.get("db") or {}
     # 兼容旧平铺格式
     if not llm and any(k in c for k in ("baseurl", "model", "apikey")):
         llm = {k: c[k] for k in ("baseurl", "model", "apikey") if k in c}
     if llm:
         cfg.save_settings(llm=llm)
         get_agent().invalidate_settings()
-    if dbc:
-        try:
-            import pymysql as _pym
-            conn = _pym.connect(charset="utf8mb4", connect_timeout=8,
-                                host=dbc["host"], port=int(dbc.get("port", 3306)),
-                                user=dbc["user"], password=dbc.get("password", ""),
-                                database=dbc["database"])
-            conn.close()
-        except Exception as e:
-            return {"ok": False, "error": f"DB 配置无效: {str(e)[:150]}"}
-        cfg.save_settings(db=dbc)
-        db.rebuild_pool()
+    # 旧导出文件中的 db 段不再用于连接或保存数据库配置。
     return {"ok": True}
 
 
@@ -434,3 +377,8 @@ def chat_delete(body: dict, source: Source = "wzyp"):
         return {"ok": False, "error": "thread_id required"}
     deleted = get_agent().memory_store.delete(memory_id(tid, source))
     return {"ok": True, "deleted": deleted}
+
+
+multisource_router, multisource_runtime = build_router(
+    lambda source: wzyp_crawler if source == "wzyp-live" else crawler)
+app.include_router(multisource_router)

@@ -1,11 +1,9 @@
-"""数据库访问层：连接池 + 查询函数"""
+"""两个采集数据源的 SQLite 只读查询层；wzyp 是 wzyp-live 的兼容别名。"""
 import json
 import re
-import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-import config as _config
 import local_store
 
 _source = ContextVar("data_source", default="wzyp")
@@ -17,7 +15,7 @@ def active_source():
 
 @contextmanager
 def use_source(source):
-    if source not in {"wzyp", "wzyp-live", "16688"}:
+    if source not in {"wzyp", "wzyp-live", "16688", "dujiao-next", "dujiaoka", "catfk", "yike"}:
         raise ValueError("未知数据源")
     token = _source.set(source)
     try:
@@ -26,45 +24,9 @@ def use_source(source):
         _source.reset(token)
 
 
-def _build_pool():
-    import pymysql
-    from dbutils.pooled_db import PooledDB
-    return PooledDB(
-        creator=pymysql, maxconnections=6, mincached=0, maxcached=3,
-        blocking=True, ping=1, connect_timeout=8, read_timeout=20, **_config.get_db_config())
-
-
-_pool = None
-_pool_lock = threading.Lock()
-
-
-def rebuild_pool():
-    """DB 配置变更后重建连接池"""
-    global _pool
-    with _pool_lock:
-        if _pool is not None:
-            _pool.close()
-        _pool = None
-
-
 def query(sql, args=None, one=False):
-    src = active_source()
-    if src in {"16688", "wzyp-live"}:
-        rows = local_store.readonly_query(sql, args, path=local_store.database_path(src))
-        return (rows[0] if rows else None) if one else rows
-    import pymysql
-    global _pool
-    with _pool_lock:
-        if _pool is None:
-            _pool = _build_pool()
-    conn = _pool.connection()
-    try:
-        with conn.cursor(pymysql.cursors.DictCursor) as cur:
-            cur.execute(sql, args or ())
-            rows = cur.fetchall()
-        return (rows[0] if rows else None) if one else rows
-    finally:
-        conn.close()
+    rows = local_store.readonly_query(sql, args, path=local_store.database_path(active_source()))
+    return (rows[0] if rows else None) if one else rows
 
 
 # ---------------- 数据 API 查询 ----------------
@@ -115,7 +77,7 @@ def list_shops(kw=None, filters=None, fetch_status=None, sort="goods_count", ord
         "create_time": "s.create_time", "avg_price": "s.avg_price",
         "min_price": "s.min_price", "max_price": "s.max_price",
     }
-    if active_source() == "16688":
+    if active_source() in {"16688", "dujiao-next", "dujiaoka", "yike"}:
         cols.update({field: f"s.{field}" for field in ("auto_count", "manual_count", "unknown_count")})
     where, args = build_filters(filters, cols)
     if fetch_status == "done":
@@ -128,22 +90,24 @@ def list_shops(kw=None, filters=None, fetch_status=None, sort="goods_count", ord
         k = f"%{kw}%"
         where = f"({where}) AND (s.token LIKE %s OR s.nickname LIKE %s OR s.contact_qq LIKE %s)"
         args = args + [k, k, k]
-    sortable = SHOP_SORTABLE | ({"auto_count", "manual_count", "unknown_count"} if active_source() == "16688" else set())
+    sortable = SHOP_SORTABLE | ({"auto_count", "manual_count", "unknown_count"} if active_source() in {"16688", "dujiao-next", "dujiaoka", "yike"} else set())
     sort = sort if sort in sortable else "goods_count"
     direction = "ASC" if order == "asc" else "DESC"
     sort_col = f"s.{sort}"
-    base = """(SELECT s.*,
-               (SELECT MIN(g.price) FROM wzyp_goods g WHERE g.shop_token=s.token) AS min_price,
-               (SELECT MAX(g.price) FROM wzyp_goods g WHERE g.shop_token=s.token) AS max_price,
-               (SELECT ROUND(AVG(g.price),2) FROM wzyp_goods g WHERE g.shop_token=s.token) AS avg_price,
-               (SELECT COUNT(*) FROM wzyp_goods g WHERE g.shop_token=s.token) AS fetched_count
+    price_scope = " AND g.currency='CNY'" if active_source() in {"dujiao-next", "dujiaoka"} else ""
+    if active_source() == "yike":
+        price_scope += " AND g.status=1"
+    fetched_scope = " AND g.status=1" if active_source() == "yike" else ""
+    base = f"""(SELECT s.*,
+               (SELECT MIN(g.price) FROM wzyp_goods g WHERE g.shop_token=s.token{price_scope}) AS min_price,
+               (SELECT MAX(g.price) FROM wzyp_goods g WHERE g.shop_token=s.token{price_scope}) AS max_price,
+               (SELECT ROUND(AVG(g.price),2) FROM wzyp_goods g WHERE g.shop_token=s.token{price_scope}) AS avg_price,
+               (SELECT COUNT(*) FROM wzyp_goods g WHERE g.shop_token=s.token{fetched_scope}) AS fetched_count
                FROM wzyp_shops s) s"""
-    if active_source() == "16688":
+    if active_source() in {"16688", "dujiao-next", "dujiaoka", "yike"}:
         local_columns = "s.auto_count, s.manual_count, s.unknown_count, s.sales_count_text, s.synced_at, "
-    elif active_source() == "wzyp-live":
-        local_columns = "s.synced_at, "
     else:
-        local_columns = ""
+        local_columns = "s.synced_at, "
     total = query(f"SELECT COUNT(*) AS c FROM {base} WHERE {where}", args, one=True)["c"]
     rows = query(f"""
         SELECT s.token, s.nickname, s.login_province, s.contact_qq, s.contact_wechat,
@@ -160,8 +124,8 @@ def list_shops(kw=None, filters=None, fetch_status=None, sort="goods_count", ord
 
 
 def list_goods(shop_token=None, goods_type=None, kw=None, price_min=None, price_max=None,
-               filters=None, sort="price", order="asc", offset=0, limit=50):
-    """商品列表：多条件筛选 + 任意字段筛选 + 排序"""
+               filters=None, sort="price", order="asc", offset=0, limit=50, keywords=None):
+    """商品列表：多关键词同时匹配商品名 + 任意字段筛选 + 排序。"""
     cols = {
         "goods_key": "g.goods_key", "shop_token": "g.shop_token", "goods_type": "g.goods_type",
         "name": "g.name", "price": "g.price", "market_price": "g.market_price",
@@ -169,6 +133,8 @@ def list_goods(shop_token=None, goods_type=None, kw=None, price_min=None, price_
     }
     where, args = build_filters(filters, cols)
     extra = []
+    if active_source() == "yike":
+        extra.append("g.status=1")
     if shop_token:
         extra.append("g.shop_token = %s"); args_extra = [shop_token]
     else:
@@ -177,6 +143,16 @@ def list_goods(shop_token=None, goods_type=None, kw=None, price_min=None, price_
         extra.append("g.goods_type = %s"); args_extra.append(goods_type)
     if kw:
         extra.append("g.name LIKE %s"); args_extra.append(f"%{kw}%")
+    seen_keywords = set()
+    for keyword in keywords or []:
+        keyword = keyword.strip()
+        normalized = keyword.lower()
+        if not keyword or normalized in seen_keywords:
+            continue
+        seen_keywords.add(normalized)
+        # INSTR 按字面子串匹配，避免把用户输入的 %、_ 当成 LIKE 通配符。
+        extra.append("INSTR(LOWER(g.name), LOWER(%s)) > 0")
+        args_extra.append(keyword)
     if price_min is not None:
         extra.append("g.price >= %s"); args_extra.append(price_min)
     if price_max is not None:
@@ -191,7 +167,9 @@ def list_goods(shop_token=None, goods_type=None, kw=None, price_min=None, price_
                   f"ON s.token=g.shop_token WHERE {where}", args, one=True)["c"]
     rows = query(f"""
         SELECT g.id, g.goods_key, g.shop_token, s.nickname AS shop_name, g.goods_type,
-               g.name, g.price, g.market_price, g.status, g.link
+               g.name, g.price, g.market_price, g.status, g.link,
+               g.currency, g.sku_label, g.delivery_method, g.stock_quantity, g.stock_status, g.synced_at,
+               g.source_url, g.source_updated_at
         FROM wzyp_goods g JOIN wzyp_shops s ON s.token=g.shop_token
         WHERE {where}
         ORDER BY {sort_col} {direction}, g.id ASC
@@ -200,34 +178,43 @@ def list_goods(shop_token=None, goods_type=None, kw=None, price_min=None, price_
 
 
 def goods_detail(goods_key):
-    d = query("SELECT * FROM wzyp_goods_detail WHERE goods_key=%s", [goods_key], one=True)
+    d = query("SELECT d.*, g.status FROM wzyp_goods_detail d JOIN wzyp_goods g ON g.goods_key=d.goods_key WHERE d.goods_key=%s", [goods_key], one=True)
     return d
 
 
 def shop_stats():
     """总览统计"""
-    return query("""
+    price_scope = " AND currency='CNY'" if active_source() in {"dujiao-next", "dujiaoka"} else ""
+    goods_scope = " WHERE status=1" if active_source() == "yike" else ""
+    if active_source() == "yike":
+        price_scope += " AND status=1"
+    return query(f"""
         SELECT
           (SELECT COUNT(*) FROM wzyp_shops) AS shop_count,
-          (SELECT COUNT(*) FROM wzyp_goods) AS goods_count,
-          (SELECT COUNT(*) FROM wzyp_goods_detail) AS detail_count,
+          (SELECT COUNT(*) FROM wzyp_goods{goods_scope}) AS goods_count,
+          (SELECT COUNT(*) FROM wzyp_goods_detail WHERE goods_key IN (SELECT goods_key FROM wzyp_goods{goods_scope})) AS detail_count,
           (SELECT IFNULL(SUM(sell_count),0) FROM wzyp_shops) AS total_sell,
           (SELECT IFNULL(SUM(deposit_money),0) FROM wzyp_shops) AS total_deposit,
-          (SELECT ROUND(AVG(price),2) FROM wzyp_goods WHERE price IS NOT NULL) AS avg_price,
-          (SELECT ROUND(MIN(price),2) FROM wzyp_goods WHERE price IS NOT NULL) AS min_price,
-          (SELECT ROUND(MAX(price),2) FROM wzyp_goods WHERE price IS NOT NULL) AS max_price
+          (SELECT ROUND(AVG(price),2) FROM wzyp_goods WHERE price IS NOT NULL{price_scope}) AS avg_price,
+          (SELECT ROUND(MIN(price),2) FROM wzyp_goods WHERE price IS NOT NULL{price_scope}) AS min_price,
+          (SELECT ROUND(MAX(price),2) FROM wzyp_goods WHERE price IS NOT NULL{price_scope}) AS max_price
     """, one=True)
 
 
 def type_dist():
     """商品类型分布"""
-    return query("SELECT goods_type, COUNT(*) AS count, ROUND(AVG(price),2) AS avg_price "
-                 "FROM wzyp_goods GROUP BY goods_type")
+    price = "CASE WHEN currency='CNY' THEN price END" if active_source() in {"dujiao-next", "dujiaoka"} else "price"
+    scope = "WHERE status=1" if active_source() == "yike" else ""
+    return query(f"SELECT goods_type, COUNT(*) AS count, ROUND(AVG({price}),2) AS avg_price "
+                 f"FROM wzyp_goods {scope} GROUP BY goods_type")
 
 
 def price_buckets():
     """价格区间分布"""
-    return query("""
+    price_scope = " AND currency='CNY'" if active_source() in {"dujiao-next", "dujiaoka"} else ""
+    if active_source() == "yike":
+        price_scope += " AND status=1"
+    return query(f"""
         SELECT bucket, COUNT(*) AS count FROM (
           SELECT CASE
             WHEN price < 10 THEN '<10'
@@ -236,13 +223,13 @@ def price_buckets():
             WHEN price < 500 THEN '100-500'
             WHEN price < 2000 THEN '500-2000'
             ELSE '>=2000' END AS bucket
-          FROM wzyp_goods WHERE price IS NOT NULL) t
+          FROM wzyp_goods WHERE price IS NOT NULL{price_scope}) t
         GROUP BY bucket ORDER BY FIELD(bucket,'<10','10-50','50-100','100-500','500-2000','>=2000')""")
 
 
 def top_keywords(n=30):
     """商品名热词（简单分词：提取 ASCII/中文词根）"""
-    rows = query("SELECT name FROM wzyp_goods")
+    rows = query("SELECT name FROM wzyp_goods" + (" WHERE status=1" if active_source() == "yike" else ""))
     freq = {}
     for r in rows:
         for w in re.findall(r"[A-Za-z]{3,12}|[\u4e00-\u9fa5]{2,4}", r["name"] or ""):
@@ -290,7 +277,22 @@ def schema_text():
         n3 = query("SELECT COUNT(*) AS c FROM wzyp_goods_detail", one=True)["c"]
     except Exception:
         n1, n2, n3 = "?", "?", "?"
-    if active_source() == "16688":
+    if active_source() == "yike":
+        source_info = (
+            "当前数据源：一可比价网聚合快照（source=yike），只包含手动按关键词采集的商品子集，非全站或整店完整数据。使用 SQLite SELECT。\n"
+            "报价为人民币；goods_type 保留来源类型原文（如卡密），delivery_method 未公开时为 unknown。\n"
+            "status=0 表示来源明确标记下架，当前报价分析必须限制 status=1；未知价格和库存为 NULL。\n"
+            "source_url 为一可公开详情；source_updated_at 为来源更新时间原文，未标时区不转换；synced_at 为本地采集时间。\n"
+            "origin_source/origin_goods_key 为可核验的原站身份，商品和店铺链接直接读取 link；不能称原站实时核验结果。\n"
+        )
+    elif active_source() in {"dujiao-next", "dujiaoka"}:
+        source_info = (
+            f"当前数据源：{active_source()} 独立货铺公开快照。使用 SQLite SELECT 语法。\n"
+            "goods_type/delivery_method 为 auto/manual/unknown；sku_label 是原始规格，currency 为原币种。\n"
+            "未知价格或库存保持 NULL；不同币种不可直接汇总金额或排名。商品和店铺链接直接读取 link。\n"
+            "商品标识包含源站和 SKU；任务表、链接发现表不可访问。\n"
+        )
+    elif active_source() == "16688":
         source_info = (
             "当前数据源：16688.com.cn 的本地 SQLite 店铺快照。使用 SQLite SELECT 语法。\n"
             "仅代表已同步店铺，并非平台全站数据。price 是未含手续费的商品标价；real_price/market_price 未公开，为 NULL。\n"
@@ -300,7 +302,7 @@ def schema_text():
             "商品和详情附加字段：sales_count_text、stock_quantity、stock_status、category_name、synced_at。\n"
             "商品 link 格式 https://www.16688.com.cn/goods/<goods_key>；店铺 link 为平台真实店铺链接。\n"
         )
-    elif active_source() == "wzyp-live":
+    else:
         source_info = (
             "当前数据源：链动小铺 wzyp.cn 的本地 SQLite 最新采集快照（source=wzyp-live）。使用 SQLite SELECT 语法。\n"
             "仅代表已发现公开店铺的商品快照，并非平台全站数据。price/real_price/market_price 为原站公开价格口径；未公开库存字段为 NULL。\n"
@@ -308,11 +310,14 @@ def schema_text():
             "商品详情附加字段：category_name（商品分类）、synced_at（同步时间）。\n"
             "店铺 link 格式 https://wzyp.cn/shop/<token>；商品 link 格式 https://wzyp.cn/item/<goods_key>。\n"
         )
-    else:
-        source_info = "当前数据源：链动小铺 wzyp.cn 的 MySQL 数据。\n"
-    example_type = "auto" if active_source() == "16688" else "equity"
-    example_type2 = "manual" if active_source() == "16688" else "resource"
-    example_type3 = "auto" if active_source() == "16688" else "card"
+    independent_types = active_source() in {"16688", "dujiao-next", "dujiaoka"}
+    example_type = "auto" if independent_types else "equity"
+    example_type2 = "manual" if independent_types else "resource"
+    example_type3 = "auto" if independent_types else "card"
+    if active_source() == "yike":
+        example_type = example_type2 = example_type3 = "卡密"
+    current_quote = "g.status=1 AND " if active_source() == "yike" else ""
+    goods_label = "商品快照，含下架记录" if active_source() == "yike" else "在售商品"
     return source_info + f"""## 当前仅允许查询以下 3 张数据表（采集任务表不可访问，禁止编造 products/shops/goods 等表名）
 
 表：wzyp_shops（店铺，{n1}行）
@@ -322,9 +327,11 @@ def schema_text():
 - auth_status 实名状态 shop_newbie 新手店 fetch_done 抓取完成 create_time 开店时间
 - link 真实店铺链接（直接读取，不要拼接域名） description 简介
 
-表：wzyp_goods（在售商品，{n2}行）
+表：wzyp_goods（{goods_label}，{n2}行）
 - goods_key 唯一标识 shop_token→wzyp_shops.token goods_type 商品类型（见当前数据源的类型说明）
 - name 商品名 price 价格 market_price 市场价 status 状态 link 真实商品链接
+- currency 原币种 sku_label 原始规格 delivery_method 发货方式 stock_quantity 公开精确库存 stock_status 库存状态
+- catalog_entry=1 表示原站目录条目，没有商品直达链接，link 为真实目录地址；不要猜测购买编号
 
 表：wzyp_goods_detail（商品详情，{n3}行）
 - goods_key 主键(→wzyp_goods.goods_key) name price real_price image description(HTML全文)
@@ -333,8 +340,8 @@ def schema_text():
 wzyp_goods.shop_token = wzyp_shops.token
 wzyp_goods_detail.goods_key = wzyp_goods.goods_key
 
-## 类型中英映射（goods_type 字段存英文）
-链动小铺：card=卡密 article=文章 resource=资源 equity=权益；16688：auto=自动发货 manual=手动发货 unknown=未公开
+## 商品类型说明
+链动小铺：card=卡密 article=文章 resource=资源 equity=权益；16688：auto=自动发货 manual=手动发货 unknown=未公开；一可：保留来源原文，如“卡密”
 
 ## 示例 SQL（照此模式写，禁止发明新表/新列）
 -- 店铺名称+链接列表：
@@ -342,10 +349,10 @@ SELECT nickname AS 店铺, link AS 链接 FROM wzyp_shops ORDER BY sell_count DE
 -- 某类型商品中哪些店铺价格低于 X：
 SELECT s.nickname AS 店铺, g.name AS 商品, g.price FROM wzyp_goods g
 JOIN wzyp_shops s ON s.token=g.shop_token
-WHERE g.goods_type='{example_type}' AND g.price < 20 ORDER BY g.price LIMIT 50
+WHERE {current_quote}g.goods_type='{example_type}' AND g.price < 20 ORDER BY g.price LIMIT 50
 -- 某类型平均价与最高价：
-SELECT ROUND(AVG(g.price),2) AS 均价, MAX(g.price) AS 最高价 FROM wzyp_goods g WHERE g.goods_type='{example_type2}'
+SELECT ROUND(AVG(g.price),2) AS 均价, MAX(g.price) AS 最高价 FROM wzyp_goods g WHERE {current_quote}g.goods_type='{example_type2}'
 -- 某类型占比最高的店铺（按该店此类商品数排序）：
 SELECT s.nickname AS 店铺, COUNT(*) AS 该类商品数 FROM wzyp_goods g
 JOIN wzyp_shops s ON s.token=g.shop_token
-WHERE g.goods_type='{example_type3}' GROUP BY s.token ORDER BY 该类商品数 DESC LIMIT 10"""
+WHERE {current_quote}g.goods_type='{example_type3}' GROUP BY s.token ORDER BY 该类商品数 DESC LIMIT 10"""

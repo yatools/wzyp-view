@@ -1,5 +1,6 @@
 """公开采集请求：进程内共享限速、有限重试和可中断等待。"""
 from datetime import datetime, timezone
+from email.parser import BytesHeaderParser
 from email.utils import parsedate_to_datetime
 import json
 import os
@@ -9,8 +10,10 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import urlsplit
 
 import requests
+from crawl_failure import details as classified_failure, normalize as normalize_failure
 
 
 class CrawlCancelled(Exception):
@@ -18,7 +21,11 @@ class CrawlCancelled(Exception):
 
 
 class CrawlBlockedError(RuntimeError):
-    """遇到 403 或人机验证时中断任务并保留断点。"""
+    """A source could not be read; diagnostics never contain cookies or tokens."""
+
+    def __init__(self, message, failure=None):
+        super().__init__(message)
+        self.failure = normalize_failure(failure or classified_failure("access_blocked"), message)
 
 
 class RateLimiter:
@@ -43,7 +50,52 @@ class RateLimiter:
             self.next_request = max(self.next_request, self.clock() + seconds)
 
 
-GLOBAL_LIMITER = RateLimiter()
+GLOBAL_LIMITER = RateLimiter(4)
+_ORIGIN_LIMITERS = {}
+_ORIGIN_LOCK = threading.Lock()
+
+
+def origin_limiter(url):
+    host = (urlsplit(url).hostname or "").lower()
+    if host in {"wzyp.cn", "www.wzyp.cn", "shop.wzyp.cn", "ldxp.cn", "www.ldxp.cn", "pay.ldxp.cn"}:
+        host = "wzyp.cn"
+    with _ORIGIN_LOCK:
+        return _ORIGIN_LIMITERS.setdefault(host, RateLimiter(0.5 if host == "wzyp.cn" else 1))
+
+
+def failure_details(response=None, stage="http", attempts=1, reason_code=None):
+    headers = getattr(response, "headers", {})
+    body = (getattr(response, "text", "") or "")[:3000]
+    server = headers.get("Server", "").lower()
+    protection = "esa" if "esa" in server or "http_bot_simple" in body else (
+        "cloudflare" if "cloudflare" in server or headers.get("CF-Ray") else "unknown")
+    request_id = headers.get("EagleId") or headers.get("CF-Ray") or ""
+    if not request_id:
+        match = re.search(r"(?:RequestID|Ray ID)\s*:\s*([A-Za-z0-9_-]{1,100})", body, re.I)
+        request_id = match[1] if match else ""
+    status = getattr(response, "status_code", None)
+    code = reason_code or "access_denied"
+    category = ("rate_limit" if status == 429 else "access_blocked" if code == "access_denied"
+                else "origin_unavailable")
+    return classified_failure(category, **{"status_code": status, "protection": protection,
+            "request_id": request_id[:100], "stage": stage, "attempts": attempts,
+            "reason_code": code}, pause_origin=True)
+
+
+def wait_for_request(url, stop, limiter=None, global_limiter=None):
+    """Reserve both clocks together; an origin in cooldown reserves no global slots."""
+    local = limiter or origin_limiter(url)
+    total = global_limiter or GLOBAL_LIMITER
+    while not stop.is_set():
+        with total.lock, local.lock:
+            global_now, local_now = total.clock(), local.clock()
+            delay = max(total.next_request - global_now, local.next_request - local_now)
+            if delay <= 0:
+                total.next_request = global_now + total.interval
+                local.next_request = local_now + local.interval
+                return
+        stop.wait(min(delay, 0.2))
+    raise CrawlCancelled()
 
 
 def retry_delay(response, attempt):
@@ -63,6 +115,7 @@ class PublicSession(requests.Session):
         super().__init__()
         self.stop = stop or threading.Event()
         self.limiter = limiter or GLOBAL_LIMITER
+        self.custom_limiter = limiter is not None
         self.headers.update({"User-Agent": "wzyp-view/16688-public-reader", "Accept": "application/json"})
 
     def check_cancel(self):
@@ -72,9 +125,13 @@ class PublicSession(requests.Session):
     def request(self, method, url, **kwargs):
         kwargs.setdefault("timeout", (8, 30))
         kwargs["allow_redirects"] = False
+        limiter = self.limiter if self.custom_limiter else origin_limiter(url)
         for attempt in range(3):
             self.check_cancel()
-            self.limiter.wait(self.stop)
+            if self.custom_limiter:
+                self.limiter.wait(self.stop)
+            else:
+                wait_for_request(url, self.stop)
             response = None
             try:
                 response = super().request(method, url, **kwargs)
@@ -87,7 +144,7 @@ class PublicSession(requests.Session):
             delay = retry_delay(response, attempt)
             if response is not None:
                 response.close()
-            self.limiter.defer(delay)
+            limiter.defer(delay)
         raise AssertionError("unreachable")
 
 
@@ -110,7 +167,7 @@ def detect_block_reason(status_code: int, body_text: str, expect_json: bool = Fa
         try:
             payload = json.loads(text)
             if isinstance(payload, dict):
-                msg = str(payload.get("msg") or payload.get("message") or "")
+                msg = str(payload.get("msg") or payload.get("message") or payload.get("error") or "")
                 code = payload.get("code")
                 if code in (403, -403) or _CAPTCHA_PATTERNS.search(msg):
                     return f"接口要求人机验证或拒绝访问: {msg or code}"
@@ -128,7 +185,7 @@ class CurlResponse:
     def __init__(self, status_code: int, content: bytes, headers: dict | None = None, url: str = ""):
         self.status_code = int(status_code)
         self.content = content if isinstance(content, (bytes, bytearray)) else str(content).encode("utf-8")
-        self.headers = headers or {}
+        self.headers = requests.structures.CaseInsensitiveDict(headers or {})
         self.url = url
 
     @property
@@ -137,6 +194,14 @@ class CurlResponse:
 
     def json(self):
         return json.loads(self.text)
+
+    @property
+    def is_redirect(self):
+        return self.status_code in {301, 302, 303, 307, 308}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
     def close(self):
         pass
@@ -157,12 +222,23 @@ def _resolve_curl_binary() -> str:
     return shutil.which("curl") or "curl"
 
 
+def _parse_curl_headers(raw: bytes) -> dict:
+    headers = {}
+    # 重定向、代理 CONNECT 和 100 Continue 各有独立头段，只保留最终响应。
+    for block in raw.replace(b"\r\n", b"\n").split(b"\n\n"):
+        status, _, fields = block.partition(b"\n")
+        if status.startswith(b"HTTP/"):
+            headers = dict(BytesHeaderParser().parsebytes(fields).items())
+    return headers
+
+
 class CurlSession:
     """使用标准 curl 客户端发起无登录态公开请求，共享进程限速与重试。"""
 
     def __init__(self, stop=None, limiter=None, runner=None, timeout=20):
         self.stop = stop or threading.Event()
         self.limiter = limiter or GLOBAL_LIMITER
+        self.custom_limiter = limiter is not None
         self.runner = runner
         self.timeout = timeout
         self.curl_bin = _resolve_curl_binary()
@@ -221,17 +297,21 @@ class CurlSession:
         if body_bytes is not None:
             cmd.extend(["--data-binary", "@-"])
         cmd.extend(["-w", "\n__WZYP_CURL_META__:%{http_code}"])
-        cmd.append(url)
-
-        proc = subprocess.run(
-            cmd,
-            input=body_bytes,
-            capture_output=True,
-            timeout=timeout + 5,
-        )
-        if proc.returncode != 0:
-            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
-            raise requests.ConnectionError(f"curl exit {proc.returncode}: {stderr or url}")
+        # 单独保存头信息，避免其混入 JSON/ZIP 等原始响应正文。
+        with tempfile.TemporaryDirectory(prefix="wzyp_curl_headers_") as header_dir:
+            header_path = os.path.join(header_dir, "headers")
+            cmd.extend(["--dump-header", header_path, url])
+            proc = subprocess.run(
+                cmd,
+                input=body_bytes,
+                capture_output=True,
+                timeout=timeout + 5,
+            )
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+                raise requests.ConnectionError(f"curl exit {proc.returncode}: {stderr or url}")
+            with open(header_path, "rb") as f:
+                response_headers = _parse_curl_headers(f.read())
 
         stdout = proc.stdout
         idx = stdout.rfind(marker)
@@ -240,7 +320,7 @@ class CurlSession:
         raw_body = stdout[:idx]
         status_str = stdout[idx + len(marker):].decode("ascii", errors="ignore").strip()
         status_code = int(status_str) if status_str.isdigit() else 0
-        return CurlResponse(status_code=status_code, content=raw_body, headers={}, url=url)
+        return CurlResponse(status_code=status_code, content=raw_body, headers=response_headers, url=url)
 
     def request(self, method: str, url: str, **kwargs) -> CurlResponse:
         timeout = kwargs.get("timeout", self.timeout)
@@ -261,9 +341,13 @@ class CurlSession:
             raw_data = kwargs["data"]
             body_bytes = raw_data if isinstance(raw_data, bytes) else str(raw_data).encode("utf-8")
 
+        limiter = self.limiter if self.custom_limiter else origin_limiter(url)
         for attempt in range(3):
             self.check_cancel()
-            self.limiter.wait(self.stop)
+            if self.custom_limiter:
+                self.limiter.wait(self.stop)
+            else:
+                wait_for_request(url, self.stop)
             response = None
             try:
                 response = self._exec_curl(
@@ -277,10 +361,10 @@ class CurlSession:
                 self.check_cancel()
                 block_reason = detect_block_reason(response.status_code, response.text, expect_json=expect_json)
                 if block_reason:
-                    raise CrawlBlockedError(block_reason)
+                    raise CrawlBlockedError(block_reason, failure_details(response, attempts=attempt + 1))
                 if response.status_code not in {429, 500, 502, 503, 504, 520, 521, 522, 524} or attempt == 2:
                     if attempt == 2 and response.status_code == 520 and not response.text.strip():
-                        raise CrawlBlockedError("HTTP 520 源站防火墙连接阻断或风控限制（连续 3 次空响应），已中断任务并保留断点")
+                        raise CrawlBlockedError("HTTP 520 连续空响应，源站原因未确定，已保留断点", failure_details(response, attempts=3, reason_code="origin_unavailable"))
                     return response
             except CrawlBlockedError:
                 raise
@@ -290,7 +374,7 @@ class CurlSession:
             delay = retry_delay(response, attempt)
             if response is not None:
                 response.close()
-            self.limiter.defer(delay)
+            limiter.defer(delay)
         raise AssertionError("unreachable")
 
     def get(self, url: str, **kwargs) -> CurlResponse:

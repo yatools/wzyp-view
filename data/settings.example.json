@@ -3,13 +3,5 @@
     "baseurl": "http://127.0.0.1:16869/v1",
     "model": "qwen38",
     "apikey": ""
-  },
-  "db": {
-    "host": "127.0.0.1",
-    "port": 3306,
-    "user": "root",
-    "password": "your-password",
-    "database": "wzyp",
-    "charset": "utf8mb4"
   }
 }

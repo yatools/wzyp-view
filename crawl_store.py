@@ -1,12 +1,17 @@
 """平台采集队列与检查点；这些表不向 AI 的只读查询开放。"""
 import os
+import json
 import time
 import uuid
+from itertools import islice
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import local_store
+from sqlite_init import write_transaction
+from task_lifecycle import worker_alive,active_job
 import platform16688 as default_platform
+from crawl_failure import normalize as normalize_failure, should_retry, validate_retry_mode
 
 ACTIVE = ("running", "cancelling")
 
@@ -61,8 +66,7 @@ class CrawlStore:
     def transaction(self):
         conn = local_store.connect(self.path)
         try:
-            with conn:
-                conn.execute("BEGIN IMMEDIATE")
+            with write_transaction(conn,self.path):
                 yield conn
         finally:
             conn.close()
@@ -77,8 +81,9 @@ class CrawlStore:
     def recover(self):
         with self.transaction() as conn:
             for row in conn.execute("SELECT * FROM crawl_jobs WHERE status IN ('running','cancelling')").fetchall():
+                if worker_alive('crawl',self.path,row['job_id']):continue
                 if not process_alive(row["owner_pid"]) or time.time() - row["heartbeat"] > 90:
-                    conn.execute("UPDATE crawl_jobs SET status='interrupted', phase='interrupted', "
+                    conn.execute("UPDATE crawl_jobs SET status='interrupted', phase=CASE WHEN workflow_version=2 THEN phase ELSE 'interrupted' END, "
                                  "updated_at=?, error='服务已停止，点击继续采集可恢复' WHERE job_id=?",
                                  (timestamp(), row["job_id"]))
 
@@ -93,31 +98,45 @@ class CrawlStore:
                          (job_id, target["kind"], target["target"], target["url"], origin, timestamp()))
 
     def enqueue(self, job_id, urls, origin):
-        with self.transaction() as conn:
-            self._enqueue(conn, job_id, urls, origin)
+        entries=iter(urls)
+        while batch:=list(islice(entries,200)):
+            with self.transaction() as conn:
+                self._enqueue(conn, job_id, batch, origin)
 
-    def create(self, mode, urls):
+    def create(self, mode, urls, reuse=True, discovery_owner=None, workflow_version=1):
         with self.transaction() as conn:
-            row = conn.execute("SELECT job_id,status FROM crawl_jobs WHERE status IN ('running','cancelling')").fetchone()
+            row = conn.execute("SELECT job_id,status,phase,workflow_version FROM crawl_jobs WHERE status IN ('running','cancelling')").fetchone()
             if row:
+                if not reuse:
+                    raise JobConflict("已有平台采集任务正在运行，发现任务等待其完成")
                 if row["status"] == "running":
+                    before=conn.execute('SELECT COALESCE(MAX(id),0) FROM crawl_items').fetchone()[0]
                     self._enqueue(conn, row["job_id"], urls, "manual")
+                    if row['workflow_version']==2 and row['phase']=='goods_collection':
+                        conn.execute("UPDATE crawl_items SET status='next_round' WHERE job_id=? AND id>?",(row['job_id'],before))
                 return row["job_id"], True
+            if active_job('crawl',self.path):
+                raise JobConflict('已有平台任务工作线程仍在运行或退出，请稍后重试')
             job_id = uuid.uuid4().hex
             now = timestamp()
             conn.execute("INSERT INTO crawl_jobs "
-                         "(job_id,mode,status,phase,created_at,updated_at,owner_pid,heartbeat) "
-                         "VALUES (?,?,'running',?,?,?,?,?)",
+                         "(job_id,mode,status,phase,created_at,updated_at,owner_pid,heartbeat,discovery_owner) "
+                         "VALUES (?,?,'running',?,?,?,?,?,?)",
                          (job_id, mode, "discovering" if mode == "discover" else "collecting",
-                          now, now, os.getpid(), time.time()))
+                          now, now, os.getpid(), time.time(), discovery_owner))
             self._enqueue(conn, job_id, urls, "manual")
+            if mode == 'discover' and workflow_version == 2:
+                conn.execute("UPDATE crawl_jobs SET workflow_version=2,phase='shop_discovery' WHERE job_id=?", (job_id,))
         return job_id, False
 
-    def resume(self, job_id):
+    def resume(self, job_id, retry_mode="transient"):
+        validate_retry_mode(retry_mode)
         with self.transaction() as conn:
             job = conn.execute("SELECT * FROM crawl_jobs WHERE job_id=?", (job_id,)).fetchone()
             if not job:
                 raise KeyError(job_id)
+            if job['status'] not in ACTIVE and worker_alive('crawl',self.path,job_id):
+                raise JobConflict('任务工作线程仍在退出，请稍后继续，避免重复运行')
             active = conn.execute("SELECT job_id FROM crawl_jobs WHERE status IN ('running','cancelling')").fetchone()
             if active:
                 if active["job_id"] == job_id:
@@ -125,20 +144,34 @@ class CrawlStore:
                 raise JobConflict("已有平台采集任务正在运行")
             if job["status"] == "completed":
                 raise JobConflict("任务已完成，请创建新任务刷新数据")
-            conn.execute("UPDATE crawl_items SET status='pending',error=NULL,updated_at=? "
-                         "WHERE job_id=? AND status IN ('working','failed')", (timestamp(), job_id))
-            conn.execute("DELETE FROM crawl_visits WHERE job_id=? AND status!='done'", (job_id,))
+            items = conn.execute("SELECT * FROM crawl_items WHERE job_id=? AND status IN ('working','failed')", (job_id,)).fetchall()
+            for item in items:
+                if item["status"] == "failed" and not should_retry(item["failure_json"], item["error"], retry_mode):
+                    continue
+                conn.execute("UPDATE crawl_items SET status='pending',error=NULL,failure_json=NULL,updated_at=? WHERE id=?",
+                             (timestamp(), item["id"]))
+                if item["shop_no"]:
+                    conn.execute("DELETE FROM crawl_visits WHERE job_id=? AND shop_no=? AND status!='done'", (job_id, item["shop_no"]))
+            conn.execute("DELETE FROM crawl_visits WHERE job_id=? AND status='working'", (job_id,))
+            probe_pending=bool(conn.execute("SELECT 1 FROM crawl_items WHERE job_id=? AND status='pending' AND shop_no IS NULL LIMIT 1",(job_id,)).fetchone())
             conn.execute("UPDATE crawl_jobs SET status='running',cancel_requested=0,owner_pid=?,heartbeat=?,"
-                         "phase=?,updated_at=?,finished_at=NULL,error=NULL WHERE job_id=?",
-                         (os.getpid(), time.time(), "collecting" if job["discovery_done"] or job["mode"] == "refresh"
+                         "phase=?,updated_at=?,finished_at=NULL,error=NULL,failure_json=NULL WHERE job_id=?",
+                         (os.getpid(), time.time(), ('shop_discovery' if job['discovery_error'] or probe_pending else job['phase']) if job['workflow_version']==2 else "collecting" if job["discovery_done"] or job["mode"] == "refresh"
                           else "discovering", timestamp(), job_id))
         return False
 
     def known_urls(self, include_discovered=False):
-        urls = {f"{self.platform.BASE_URL}/shop/{row['token']}" for row in self.rows("SELECT token FROM wzyp_shops")}
+        if getattr(self.platform, "MULTI_ORIGIN", False):
+            urls = {row["link"] for row in self.rows("SELECT link FROM wzyp_shops")}
+        else:
+            urls = {f"{self.platform.BASE_URL}/shop/{row['token']}" for row in self.rows("SELECT token FROM wzyp_shops")}
         if include_discovered:
             urls.update(row["url"] for row in self.rows("SELECT DISTINCT url FROM crawl_items"))
         return sorted(urls)
+
+    def history(self, limit=20):
+        return [self.report(row["job_id"]) for row in self.rows(
+            "SELECT job_id FROM crawl_jobs ORDER BY created_at DESC,rowid DESC LIMIT ?", (limit,))]
 
     def heartbeat(self, job_id):
         with self.transaction() as conn:
@@ -155,7 +188,7 @@ class CrawlStore:
         with self.transaction() as conn:
             if urls is not None:
                 self._enqueue(conn, job_id, urls, origin or default_origin)
-            conn.execute("UPDATE crawl_jobs SET discovery_done=?,discovery_error=?,phase='collecting',updated_at=? WHERE job_id=?",
+            conn.execute("UPDATE crawl_jobs SET discovery_done=?,discovery_error=?,phase=CASE WHEN workflow_version=2 THEN phase ELSE 'collecting' END,updated_at=? WHERE job_id=?",
                          (int(error is None), error, timestamp(), job_id))
 
     def claim_item(self, job_id):
@@ -180,10 +213,16 @@ class CrawlStore:
             rows = self.rows("SELECT token AS shop_no FROM wzyp_shops WHERE token=?", (target,))
         return rows[0]["shop_no"] if rows else None
 
-    def remember(self, item, shop):
+    def remember(self, item, shop,goods=()):
         aliases = {(item["kind"], item["target"]), ("shop", shop["shop_no"])}
         if shop.get("shop_alias"):
             aliases.add(("shop", shop["shop_alias"]))
+        for good in goods:
+            try:
+                target=self.platform.normalize_target(good.get('link') or '')
+                if target['kind']=='goods' and target['target']==str(good.get('goods_key')):
+                    aliases.add(('goods',target['target']))
+            except ValueError:continue
         with self.transaction() as conn:
             conn.executemany("INSERT INTO crawl_aliases(kind,target,shop_no) VALUES (?,?,?) "
                              "ON CONFLICT(kind,target) DO UPDATE SET shop_no=excluded.shop_no",
@@ -194,14 +233,20 @@ class CrawlStore:
             return conn.execute("INSERT OR IGNORE INTO crawl_visits(job_id,shop_no,status) VALUES (?,?,'working')",
                                 (job_id, shop_no)).rowcount == 1
 
-    def finish_item(self, item, status, shop_no=None, error=None, result=None):
+    def finish_item(self, item, status, shop_no=None, error=None, result=None, failure=None):
         with self.transaction() as conn:
-            conn.execute("UPDATE crawl_items SET status=?,shop_no=?,error=?,updated_at=? WHERE id=?",
-                         (status, shop_no, error, timestamp(), item["id"]))
+            conn.execute("UPDATE crawl_items SET status=?,shop_no=?,error=?,failure_json=?,updated_at=? WHERE id=?",
+                         (status, shop_no, error, json.dumps(failure) if failure else None, timestamp(), item["id"]))
             if result:
                 conn.execute("UPDATE crawl_visits SET status='done',goods_count=?,error=NULL WHERE job_id=? AND shop_no=?",
                              (result["goods_count"], item["job_id"], shop_no))
-                self._enqueue(conn, item["job_id"], result.get("discovered_urls", []), result["shop"]["link"])
+                job = conn.execute("SELECT mode,workflow_version FROM crawl_jobs WHERE job_id=?", (item["job_id"],)).fetchone()
+                mode = job['mode']
+                if mode != "targets":
+                    before = conn.execute('SELECT COALESCE(MAX(id),0) FROM crawl_items').fetchone()[0]
+                    self._enqueue(conn, item["job_id"], result.get("discovered_urls", []), result["shop"]["link"])
+                    if job['workflow_version']==2:
+                        conn.execute("UPDATE crawl_items SET status='next_round' WHERE job_id=? AND id>?", (item['job_id'],before))
             elif status == "failed" and shop_no:
                 conn.execute("UPDATE crawl_visits SET status='failed',error=? WHERE job_id=? AND shop_no=?",
                              (error, item["job_id"], shop_no))
@@ -209,6 +254,17 @@ class CrawlStore:
                 conn.execute("DELETE FROM crawl_visits WHERE job_id=? AND shop_no=? AND status!='done'",
                              (item["job_id"], shop_no))
             conn.execute("UPDATE crawl_jobs SET updated_at=? WHERE job_id=?", (timestamp(), item["job_id"]))
+
+    def finish_preview(self,item,key,eligible):
+        # The directory lives in another SQLite file. Reconstruct ownership after
+        # a crash between saving that preview and checkpointing this queue item.
+        with self.transaction() as conn:
+            owner=conn.execute("SELECT 1 FROM crawl_items WHERE job_id=? AND shop_no=? AND id!=? "
+                               "AND status IN ('previewed','pending','working','done') LIMIT 1",
+                               (item['job_id'],key,item['id'])).fetchone()
+            state='previewed' if eligible and not owner else 'skipped'
+            conn.execute('UPDATE crawl_items SET status=?,shop_no=?,updated_at=? WHERE id=?',
+                         (state,key,timestamp(),item['id']))
 
     def cancel(self, job_id):
         with self.transaction() as conn:
@@ -219,11 +275,11 @@ class CrawlStore:
                 conn.execute("UPDATE crawl_jobs SET cancel_requested=1,status='cancelling',updated_at=? WHERE job_id=?",
                              (timestamp(), job_id))
 
-    def finish_job(self, job_id, status, error=None):
+    def finish_job(self, job_id, status, error=None, failure=None):
         with self.transaction() as conn:
-            conn.execute("UPDATE crawl_jobs SET status=?,phase=?,error=?,updated_at=?,finished_at=? WHERE job_id=?",
+            conn.execute("UPDATE crawl_jobs SET status=?,phase=CASE WHEN workflow_version=2 THEN phase ELSE ? END,error=?,failure_json=?,updated_at=?,finished_at=? WHERE job_id=?",
                          (status, "interrupted" if status == "interrupted" else "finished", error,
-                          timestamp(), timestamp(), job_id))
+                          json.dumps(failure) if failure else None, timestamp(), timestamp(), job_id))
 
     def report(self, job_id=None):
         if job_id:
@@ -247,9 +303,22 @@ class CrawlStore:
                            "FROM crawl_visits WHERE job_id=?", args)[0]
         job.update({key: value or 0 for key, value in {**items, **visits}.items()})
         job["failure_count"] = job["failed_links"] + job["failed_shops"]
-        job["failures"] = self.rows("SELECT url,shop_no,error FROM crawl_items "
+        job["failures"] = self.rows("SELECT url,shop_no,error,failure_json FROM crawl_items "
                                     "WHERE job_id=? AND status='failed' ORDER BY id DESC LIMIT 10", args)
         job["last_error"] = job["error"] or job["discovery_error"] or (job["failures"][0]["error"] if job["failures"] else None)
+        job["failure"] = json.loads(job.pop("failure_json") or "null")
+        if job["failure"]:
+            job["failure"] = normalize_failure(job["failure"], job["error"])
+        for item in job["failures"]:
+            item["failure"] = normalize_failure(item.pop("failure_json"), item["error"])
+        if not job["failure"] and job["failures"]:
+            job["failure"] = job["failures"][0]["failure"]
+        failed = self.rows("SELECT error,failure_json FROM crawl_items WHERE job_id=? AND status='failed'", args)
+        job["retryable_failures"] = sum(should_retry(item["failure_json"], item["error"]) for item in failed)
+        job["permanent_failures"] = len(failed) - job["retryable_failures"]
         job.pop("owner_pid")
         job.pop("heartbeat")
+        if job.get('workflow_version')==2:
+            from shop_preview import PreviewStore
+            job.update(PreviewStore().summary(job['job_id']))
         return job

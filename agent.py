@@ -3,12 +3,14 @@
   planner(LLM+工具) → tools(只读SQL) → analyst(总结成中文洞察)
 记忆：SqliteSaver 持久化 thread 会话（跨请求多轮对话）
 """
+import asyncio
 import ipaddress
 import json
 import os
 import re
 import threading
 from urllib.parse import urlparse
+import weakref
 
 import httpx
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -18,12 +20,46 @@ from langgraph.graph.message import add_messages
 from typing_extensions import Annotated, TypedDict
 
 import db
-from config import CHECKPOINTER_DB, get_llm_config, load_settings, save_settings
+from config import CHECKPOINTER_DB, get_llm_config
 
-_lock = threading.Lock()
-_http_client_key = None
-_http_sync_client: httpx.Client | None = None
-_http_async_client: httpx.AsyncClient | None = None
+# 模型回收可能发生在持锁期间；允许其 finalizer 重新进入缓存锁。
+_lock = threading.RLock()
+_http_clients = None
+_async_cleanup_tasks = set()
+
+
+async def _close_async_client(client):
+    try:
+        await client.aclose()
+    except Exception:
+        pass
+
+
+class _HttpClients:
+    def __init__(self, key, **options):
+        self.key = key
+        self.users = 0
+        self.retired = False
+        self.sync = httpx.Client(**options)
+        try:
+            self.async_client = httpx.AsyncClient(**options)
+        except Exception:
+            self.sync.close()
+            raise
+
+    def close(self):
+        try:
+            self.sync.close()
+        except Exception:
+            pass
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(_close_async_client(self.async_client))
+        else:
+            task = loop.create_task(_close_async_client(self.async_client))
+            _async_cleanup_tasks.add(task)
+            task.add_done_callback(_async_cleanup_tasks.discard)
 
 
 def is_loopback_url(url: str) -> bool:
@@ -64,31 +100,26 @@ def _proxy_env_signature() -> tuple:
     return tuple((k, os.environ.get(k, "")) for k in names)
 
 
-def _close_clients_unlocked():
-    global _http_client_key, _http_sync_client, _http_async_client
-    sync_client, async_client = _http_sync_client, _http_async_client
-    _http_client_key = None
-    _http_sync_client = None
-    _http_async_client = None
-    if sync_client is not None:
-        try:
-            sync_client.close()
-        except Exception:
-            pass
-    if async_client is not None:
-        try:
-            # AsyncClient without active event loop can close underlying transport if needed
-            transport = getattr(async_client, "_transport", None)
-            if transport is not None and hasattr(transport, "close"):
-                transport.close()
-        except Exception:
-            pass
+def _retire_clients_unlocked():
+    global _http_clients
+    clients, _http_clients = _http_clients, None
+    if clients is not None:
+        clients.retired = True
+        if not clients.users:
+            clients.close()
+
+
+def _release_http_clients(clients):
+    with _lock:
+        clients.users -= 1
+        if clients.retired and not clients.users:
+            clients.close()
 
 
 def close_http_clients():
-    """在服务关闭或重置时释放受控 HTTP 客户端连接"""
+    """退役缓存；仍被模型使用的连接在最后一个模型释放后关闭。"""
     with _lock:
-        _close_clients_unlocked()
+        _retire_clients_unlocked()
 
 
 def get_llm_settings():
@@ -98,56 +129,57 @@ def get_llm_settings():
 
 
 def invalidate_settings():
-    """保存配置后失效并关闭已缓存的 HTTP 客户端，使新请求立即使用新配置"""
+    """新请求立即使用新配置，已有模型与流式请求继续使用原连接。"""
     close_http_clients()
 
 
-def _get_http_clients(baseurl: str) -> tuple[httpx.Client, httpx.AsyncClient]:
-    global _http_client_key, _http_sync_client, _http_async_client
+def _get_http_clients(baseurl: str) -> _HttpClients:
+    global _http_clients
     loopback = is_loopback_url(baseurl)
     key = ("loopback", baseurl) if loopback else ("remote", baseurl, _proxy_env_signature())
     with _lock:
         if (
-            _http_client_key == key
-            and _http_sync_client is not None
-            and not _http_sync_client.is_closed
-            and _http_async_client is not None
-            and not _http_async_client.is_closed
+            _http_clients is not None
+            and _http_clients.key == key
+            and not _http_clients.sync.is_closed
+            and not _http_clients.async_client.is_closed
         ):
-            return _http_sync_client, _http_async_client
-
-        _close_clients_unlocked()
-        if loopback:
-            _http_sync_client = httpx.Client(trust_env=False, timeout=60.0)
-            _http_async_client = httpx.AsyncClient(trust_env=False, timeout=60.0)
+            clients = _http_clients
         else:
-            openai_proxy = (os.environ.get("OPENAI_PROXY") or "").strip() or None
-            if openai_proxy:
-                _http_sync_client = httpx.Client(proxy=openai_proxy, trust_env=True, timeout=60.0)
-                _http_async_client = httpx.AsyncClient(proxy=openai_proxy, trust_env=True, timeout=60.0)
-            else:
-                _http_sync_client = httpx.Client(trust_env=True, timeout=60.0)
-                _http_async_client = httpx.AsyncClient(trust_env=True, timeout=60.0)
-        _http_client_key = key
-        return _http_sync_client, _http_async_client
+            _retire_clients_unlocked()
+            options = {"trust_env": not loopback, "timeout": 60.0}
+            if not loopback:
+                openai_proxy = (os.environ.get("OPENAI_PROXY") or "").strip()
+                if openai_proxy:
+                    options["proxy"] = openai_proxy
+            clients = _http_clients = _HttpClients(key, **options)
+        clients.users += 1
+        return clients
 
 
 def build_llm():
     s = get_llm_settings()
-    sync_client, async_client = _get_http_clients(s["baseurl"])
-    return ChatOpenAI(
-        base_url=s["baseurl"],
-        model=s["model"],
-        api_key=s.get("apikey") or "EMPTY",
-        temperature=0.2,
-        timeout=60,
-        max_retries=1,
-        streaming=True,
-        http_client=sync_client,
-        http_async_client=async_client,
-        openai_proxy="",
-        http_socket_options=(),
-    )
+    clients = _get_http_clients(s["baseurl"])
+    try:
+        llm = ChatOpenAI(
+            base_url=s["baseurl"],
+            model=s["model"],
+            api_key=s.get("apikey") or "EMPTY",
+            temperature=0.2,
+            timeout=60,
+            max_retries=1,
+            streaming=True,
+            http_client=clients.sync,
+            http_async_client=clients.async_client,
+            openai_proxy="",
+            http_socket_options=(),
+        )
+        # 流、bind_tools 等保留模型引用，直到它们结束才释放该模型的连接租约。
+        weakref.finalize(llm, _release_http_clients, clients)
+        return llm
+    except Exception:
+        _release_http_clients(clients)
+        raise
 
 
 def redact_sensitive(text: str, apikey: str | None = None) -> str:
@@ -283,22 +315,35 @@ SYSTEM_PROMPT = """你是店铺数据分析助手，擅长用中文回答关于�
 ## 分析风格
 - 结论先行，再给依据（查询出的数字）。
 - 涉及排名时列 Top3~5。
-- 价格统一 ¥ 保留两位小数。"""
+- 价格按当前来源的原币种展示并保留两位小数；链动小铺和 16688 为人民币 ¥。未知币种不猜测，不换汇。"""
 
 
 def _source_note_for(source: str | None) -> str:
+    if source == "catfk":
+        return ("当前数据源：云猫寄售 catfk.com 的独立 SQLite 公开商品快照。"
+                "goods_type 为 card/article/resource/equity；价格为人民币。"
+                "仅分析完整采集成功的店铺，不代表全站覆盖；未知库存和发货方式不能推断。")
+    if source == "yike":
+        return ("当前数据源：一可比价网聚合快照，仅包含手动按关键词采集的商品子集，不能声称全站或整店完整。"
+                "报价为人民币，来源不是本程序直接核验的原店铺实时数据；goods_type 保留来源商品类型，发货方式未知。"
+                "status=0 为来源明确下架商品，当前报价分析应限制 status=1；未知价格、库存不能当成 0。"
+                "source_updated_at 为来源更新时间原文，未标时区不转换；synced_at 为本地采集时间。"
+                "source_url 是一可详情，link 是原商品链接；均直接读取，不拼接。")
+    if source in {"dujiao-next", "dujiaoka"}:
+        return (f"当前数据源：{source} 独立货铺公开快照。auto/manual/unknown 为发货方式。"
+                "sku_label 为原始规格、currency 为原币种；金额比较必须限制同一币种，美元不能标成 ¥。"
+                "商品链接直接读取 link，不拼接标识；仅分析完整采集成功的店铺。")
     if source == "16688":
         return (
             "当前数据源：16688.com.cn，SQLite 快照。价格未含手续费，万+销量为公开下限；"
             "auto/manual/unknown 是发货方式。只分析已同步店铺。"
         )
-    if source == "wzyp-live":
-        return (
-            "当前数据源：链动小铺 wzyp.cn（最新采集），SQLite 快照。"
-            "仅包含已发现公开店铺的商品快照，不代表全站覆盖；"
-            "goods_type 为 card/article/resource/equity，含 category_name 与 synced_at。"
-        )
-    return "当前数据源：链动小铺 wzyp.cn，MySQL。"
+    return (
+        "当前数据源：链动小铺 wzyp.cn，SQLite 采集快照。"
+        "仅包含从原站完整采集成功的公开店铺与商品，不代表全站覆盖；"
+        "历史备份只用于发现店铺入口，不包含历史商品或价格。"
+        "goods_type 为 card/article/resource/equity，含 category_name 与 synced_at。"
+    )
 
 
 def planner_node(state: AgentState):

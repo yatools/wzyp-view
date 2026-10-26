@@ -9,11 +9,6 @@ services:
     environment:
       TZ: Asia/Shanghai
       # ---- 配置方式一：环境变量（优先级高于 settings.json）----
-      # WZYP_DB_HOST: 127.0.0.1
-      # WZYP_DB_PORT: "33333"
-      # WZYP_DB_USER: root
-      # WZYP_DB_PASSWORD: "change-me"
-      # WZYP_DB_DATABASE: wzyp
       # WZYP_LLM_BASEURL: http://host.docker.internal:16869/v1
       # WZYP_LLM_MODEL: qwen38
       # WZYP_LLM_APIKEY: ""

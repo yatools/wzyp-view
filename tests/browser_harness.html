@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>隔离浏览器回归</title>
+<link rel="stylesheet" href="/static/app.css"><link rel="stylesheet" href="/static/workspace.css">
+<style>body{display:block;height:auto;overflow:auto;padding:25px}#page-catalog,#page-compare{display:block}#results{padding:20px;line-height:2}#results .pass{color:#23864f}#results .fail{color:#bf4036}.test-output{padding:20px;background:#fff;border-radius:12px}</style>
+<h1>隔离浏览器回归</h1><p>使用合成商品和只读模拟接口，不接触真实采集库或 LLM。</p>
+<ol id="results"></ol><strong id="outcome" role="status">正在运行…</strong>
+<nav><button data-page="catalog">商品搜索</button><button data-page="compare">对比清单 <span id="compareNavCount"></span></button></nav>
+<div id="toast"></div><div id="page-discovery" class="workspace"></div><div id="page-catalog" class="workspace"></div><div id="page-compare" class="workspace"></div>
+<script src="/static/marked.min.js"></script><script src="/static/vendor/purify.min.js"></script><script src="/static/safe-render.js"></script>
+<script type="module">
+import {initializeCatalog,loadCatalog,openProduct} from '/static/modules/catalog.js';
+import {toggleCompare,contains,renderCompare,initializeCompare} from '/static/modules/compare.js';
+import {initializeTasks,refreshTasks} from '/static/modules/tasks.js';
+import {loadSources} from '/static/modules/api.js';
+await loadSources();
+const results=document.getElementById('results');let passed=0,failed=0;
+function assert(value,message){if(!value)throw Error(message);}
+async function test(name,fn){const line=document.createElement('li');try{await fn();passed++;line.className='pass';line.textContent='PASS · '+name;}catch(e){failed++;line.className='fail';line.textContent='FAIL · '+name+'：'+e.message;}results.append(line);}
+async function waitFor(fn){const end=Date.now()+4000;while(Date.now()<end){if(fn())return;await new Promise(r=>setTimeout(r,20));}throw Error('等待状态超时');}
+const key='wzyp_compare_v1';localStorage.removeItem(key);
+await test('Markdown 清理脚本、事件处理器和危险链接，同时保留正常格式',()=>{
+ const box=document.createElement('div');box.innerHTML=window.renderSafeMarkdown('**正常文本** <img src=x onerror="window.__xss=1"><script>window.__xss=1</'+'script><a href="javascript:alert(1)">链接</a><svg onload="window.__xss=1"></svg>');
+ assert(box.querySelector('strong')?.textContent==='正常文本','正常格式应保留');
+ assert(!box.querySelector('script,svg,[onerror],[onload],a[href^="javascript:"]'),'存在未清理的危险内容');
+});
+await test('对比按来源区分相同商品编号，并且最多保留八件',()=>{
+ toggleCompare({source:'wzyp-live',goods_key:'same',name:'<img src=x onerror=alert(1)>',price:10,currency:'CNY'});
+ toggleCompare({source:'16688',goods_key:'same',name:'另一个来源',price:20,currency:'CNY'});
+ toggleCompare({source:'16688',goods_key:'gone',name:'已下架测试',price:999,currency:'CNY'});
+ for(let i=3;i<9;i++)toggleCompare({source:'dujiao-next',goods_key:'item-'+i,name:'测试 '+i,price:i,currency:'CNY'});
+ assert(JSON.parse(localStorage.getItem(key)).length===8,'应保留八件');
+ assert(contains({source:'wzyp-live',goods_key:'same'})&&contains({source:'16688',goods_key:'same'}),'不同来源被错误合并');
+});
+await test('重新载入对比模块可从浏览器存储恢复清单',async()=>{
+ const restored=await import('/static/modules/compare.js?restore-test=1');restored.initializeCompare();
+ assert(document.getElementById('compareNavCount').textContent==='8','清单未恢复');
+});
+await test('对比标题按文本显示，下架商品不继续显示旧价',async()=>{
+ await renderCompare(false);assert(!document.getElementById('page-compare').querySelector('img'),'商品标题被作为 HTML 执行');
+ await renderCompare(true);assert(document.getElementById('page-compare').textContent.includes('当前快照不可用'),'下架状态未显示');
+ assert(!document.getElementById('page-compare').textContent.includes('999.00'),'下架商品仍显示旧价');
+});
+initializeCatalog();
+initializeTasks();
+await refreshTasks();
+await test('一可采集入口独立于原站发现，手动关键词任务可取消续跑',async()=>{
+ assert(document.querySelector('[name="catalogSource"][value="yike"]'),'搜索缺少一可来源');
+ assert(!document.querySelector('[name="discoverySource"][value="yike"]'),'聚合来源混入整店发现');
+ assert(document.querySelectorAll('#sourceInput-yike').length===1,'一可卡片重复');
+ document.getElementById('sourceInput-yike').value=' GPT Plus ';
+ document.getElementById('yikeForm').dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+ await waitFor(()=>document.getElementById('sourceStatus-yike').textContent.includes('关键词：GPT Plus')&&document.querySelector('[data-source="yike"][data-action="cancel"]'));
+ assert(document.getElementById('yikeStart').disabled,'运行任务期间仍可重复启动');
+ document.querySelector('[data-source="yike"][data-action="cancel"]').click();
+ await waitFor(()=>document.querySelector('[data-source="yike"][data-action="resume"]'));
+ document.querySelector('[data-source="yike"][data-action="resume"]').click();
+ await waitFor(()=>document.getElementById('sourceStatus-yike').textContent.includes('已完成'));
+});
+await test('搜索加入多个关键词时传递字面交集，不拆分特殊字符',async()=>{
+ const input=document.getElementById('catalogKeywordInput');input.value='100%_';input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+ input.value='Plus';input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+ await waitFor(()=>document.getElementById('catalogBody').textContent.includes('100%_ Plus result'));
+});
+await test('慢请求不能覆盖较新的搜索结果',async()=>{
+ document.getElementById('catalogForm').reset();await new Promise(r=>setTimeout(r,0));
+ const input=document.getElementById('catalogKeywordInput');input.value='slow';input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+ document.querySelector('#catalogKeywords button').click();input.value='fast';input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+ await waitFor(()=>document.getElementById('catalogBody').textContent.includes('fast result'));
+ await new Promise(r=>setTimeout(r,400));assert(document.getElementById('catalogBody').textContent.includes('fast result'),'旧请求覆盖了新结果');
+});
+await test('重置筛选恢复默认人民币和价格升序',async()=>{
+ document.getElementById('catalogCurrency').value='USD';document.getElementById('catalogOrder').value='desc';
+ document.getElementById('catalogForm').reset();await new Promise(r=>setTimeout(r,0));
+ assert(document.getElementById('catalogCurrency').value==='CNY','重置后币种未恢复');
+ assert(document.getElementById('catalogOrder').value==='asc','重置后排序未恢复');
+});
+await test('商品说明位于无脚本权限的隔离 iframe',async()=>{
+ await openProduct({source:'16688',goods_key:'fixture'});
+ const frame=document.getElementById('catalogDescription');assert(frame?.getAttribute('sandbox')==='','商品说明缺少隔离');
+ assert(!frame.srcdoc.includes('onerror')&&!frame.srcdoc.includes('<script'),'商品说明未清理');
+ document.getElementById('catalogDetail').close();
+});
+await test('一可详情和对比保留来源时间、两种链接和隔离说明',async()=>{
+ await renderCompare(false);document.getElementById('compareClear').click();
+ await openProduct({source:'yike',goods_key:'fixture'});
+ const dialog=document.getElementById('catalogDetail');
+ assert(dialog.textContent.includes('一可聚合快照')&&dialog.textContent.includes('2026-10-24 01:14:53'),'来源或原文时间丢失');
+ assert(dialog.querySelector('a[href="https://vs.yiketools.com/goods/9001/fixture"]'),'一可详情链接丢失');
+ assert(dialog.querySelector('a[href="https://fixture.example/buy/1"]'),'原商品链接丢失');
+ assert(document.getElementById('catalogDescription').getAttribute('sandbox')==='','说明未隔离');
+ document.getElementById('detailAddCompare').click();dialog.close();
+ await renderCompare(true);
+ const comparison=document.getElementById('page-compare');
+ assert(comparison.textContent.includes('2026-10-24 01:14:53')&&comparison.textContent.includes('关键词子集'),'对比来源丢失');
+ assert(JSON.parse(localStorage.getItem(key))[0].source_url.includes('vs.yiketools.com'),'来源未持久保存');
+ toggleCompare({source:'yike',goods_key:'archived',name:'下架聚合报价',price:777});
+ await renderCompare(true);
+ assert(comparison.textContent.includes('来源已标记下架')&&!comparison.textContent.includes('777.00'),'下架聚合报价仍展示旧价');
+});
+await test('整页切换一可来源后显示范围说明，并隐藏原站整店采集',async()=>{
+ const old=localStorage.getItem('wzyp_source'),frame=document.createElement('iframe');frame.hidden=true;frame.src='/preview';
+ try{
+  const loaded=new Promise((resolve,reject)=>{frame.onload=resolve;frame.onerror=()=>reject(Error('预览加载失败'));});document.body.append(frame);await loaded;
+  await frame.contentWindow.sourceRegistryReady;
+  const child=frame.contentDocument,select=child.getElementById('dataSource');
+  assert(select.querySelector('option[value="yike"]'),'全局读取来源缺少一可');
+  select.value='yike';select.dispatchEvent(new Event('change',{bubbles:true}));
+  child.querySelector('nav button[data-page="dashboard"]').click();
+  await waitFor(()=>!child.getElementById('sourceReadNotice').hidden);
+  assert(child.getElementById('sourcePanel').hidden,'一可页面出现整店采集按钮');
+  assert(child.getElementById('sourceReadNotice').textContent.includes('关键词采集的商品子集'),'未说明覆盖范围');
+  assert(child.querySelector('#gType option[value="卡密"]'),'一可类型筛选未使用来源原文');
+  child.querySelector('nav button[data-page="catalog"]').click();
+  assert(child.getElementById('sourceReadNotice').hidden,'单来源说明混入跨来源搜索');
+ }finally{frame.remove();if(old===null)localStorage.removeItem('wzyp_source');else localStorage.setItem('wzyp_source',old);}
+});
+localStorage.removeItem(key);
+async function recordedAt(count){const end=Date.now()+4000;while(Date.now()<end){const data=await fetch('/test/discovery/requests').then(r=>r.json());if(data.requests.length>=count)return data.requests;await new Promise(r=>setTimeout(r,20));}throw Error('未收到预期任务操作');}
+await test('发现页分别展示核验与目录预算、成功事件和业务失败',async()=>{
+ await fetch('/test/discovery/setup',{method:'POST'});await refreshTasks();
+ const current=document.getElementById('discoveryCurrent');
+ assert(document.getElementById('discoveryProbeLimit').value==='200','核验默认预算错误');
+ assert(current.textContent.includes('源站核验 200 / 200')&&current.textContent.includes('目录页 20 / 20'),'两种预算混在一起');
+ assert(current.textContent.includes('最近收录')&&current.textContent.includes('最近失败')&&current.textContent.includes('默认跳过'),'成功与失败提示缺失');
+ assert(!current.textContent.includes('已就绪')&&!current.querySelector('[onerror]'),'状态或错误转义不正确');
+});
+await test('普通继续不加预算；追加预算与重试全部显式传递',async()=>{
+ const first=document.getElementById('discoveryResume');first.click();
+ let calls=await recordedAt(1);await waitFor(()=>document.getElementById('discoveryResume')!==first);
+ assert(calls[0].body.extra_pages===0&&calls[0].body.extra_probes===0&&calls[0].body.retry_mode==='transient','普通继续意外增加预算或重试永久失败');
+ document.getElementById('extraProbes').value='7';document.getElementById('extraPages').value='0';document.getElementById('discoveryRetryMode').value='all';
+ document.querySelector('.resume-options').open=true;await refreshTasks();
+ assert(document.getElementById('extraProbes').value==='7'&&document.getElementById('discoveryRetryMode').value==='all'&&document.querySelector('.resume-options').open,'轮询清空了正在填写的续采设置');
+ const second=document.getElementById('discoveryExtend');second.click();
+ calls=await recordedAt(2);await waitFor(()=>document.getElementById('discoveryExtend')!==second);
+ assert(calls[1].body.extra_probes===7&&calls[1].body.extra_pages===0&&calls[1].body.retry_mode==='all','追加预算参数丢失');
+ document.querySelector('[data-source="catfk"][data-action="resume-all"]').click();
+ calls=await recordedAt(3);
+ assert(calls.some(x=>x.action==='source-resume'&&x.body.retry_mode==='all'),'平台主动重试未传范围');
+});
+await test('单条重试保留原失败；未知入口只预填重新发现',async()=>{
+ document.getElementById('discoveryCandidatesToggle').click();
+ await waitFor(()=>document.querySelector('[data-retry-candidate="1"]'));
+ document.querySelector('[data-retry-candidate="1"]').click();
+ await waitFor(()=>document.getElementById('candidateRows').textContent.includes('已关联 1 次单店重试'));
+ assert(document.getElementById('candidateRows').textContent.includes('店铺已打烊'),'原失败被覆盖');
+ document.querySelector('[data-retry-candidate="2"]').click();
+ await waitFor(()=>document.getElementById('discoveryURLs').value==='https://unknown.example/');
+ assert(!document.getElementById('discoveryIndexes').checked,'未知入口意外开启全量索引');
+});
+const outcome=document.getElementById('outcome');outcome.textContent=`${passed} 通过 / ${failed} 失败`;outcome.dataset.failed=failed;
+</script>
+</html>

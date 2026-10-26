@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import gc
 import json
 import os
 import tempfile
@@ -7,7 +9,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -18,6 +20,19 @@ import platformwzyp
 import public_http
 import server
 from crawler16688 import CrawlManager
+
+
+@contextmanager
+def local_http_server(handler):
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    try:
+        yield httpd
+    finally:
+        httpd.shutdown()
+        worker.join(timeout=5)
+        httpd.server_close()
 
 
 class FakeResponse:
@@ -154,11 +169,14 @@ class LlmProxyAndErrorTests(unittest.TestCase):
 
         class Proxy503Handler(BaseHTTPRequestHandler):
             def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 proxy_hits.append(self.path)
+                body = b'{"error":{"message":"proxy 503 unavailable"}}'
                 self.send_response(503)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(b'{"error":{"message":"proxy 503 unavailable"}}')
+                self.wfile.write(body)
 
             def do_CONNECT(self):
                 proxy_hits.append(self.path)
@@ -280,6 +298,81 @@ class LlmProxyAndErrorTests(unittest.TestCase):
             proxy_server.server_close()
             local_server.server_close()
 
+    def test_settings_changes_keep_active_streams_and_new_models_usable(self) -> None:
+        for change in ("save_unchanged", "change_baseurl"):
+            with self.subTest(change=change):
+                release_second = threading.Event()
+                paths = []
+
+                class StreamingHandler(BaseHTTPRequestHandler):
+                    def do_POST(self):
+                        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                        paths.append(self.path)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.end_headers()
+                        for text in ("first", "second"):
+                            if text == "second":
+                                release_second.wait(timeout=5)
+                            chunk = {
+                                "id": "chatcmpl-review",
+                                "object": "chat.completion.chunk",
+                                "created": 1,
+                                "model": "test",
+                                "choices": [{"index": 0, "delta": {"content": text},
+                                             "finish_reason": "stop" if text == "second" else None}],
+                            }
+                            try:
+                                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                                self.wfile.flush()
+                            except OSError:
+                                return
+                        self.wfile.write(b"data: [DONE]\n\n")
+
+                    def log_message(self, *args):
+                        pass
+
+                with local_http_server(StreamingHandler) as httpd:
+                    baseurl = f"http://127.0.0.1:{httpd.server_port}"
+                    settings = {"baseurl": baseurl + "/v1", "model": "test", "apikey": "EMPTY"}
+                    with patch.object(agent, "get_llm_settings", return_value=settings):
+                        old_llm = agent.build_llm()
+                        stream = old_llm.stream("test")
+                        try:
+                            first = next(stream)
+                            if change == "save_unchanged":
+                                agent.invalidate_settings()
+                            else:
+                                settings["baseurl"] = baseurl + "/new/v1"
+                            new_llm = agent.build_llm()
+                            self.assertIsNot(old_llm.http_client, new_llm.http_client)
+                            release_second.set()
+                            text = first.content + "".join(part.content for part in stream)
+                            self.assertEqual(text, "firstsecond")
+                            self.assertEqual(new_llm.invoke("test").content, "firstsecond")
+                            expected_path = "/v1/chat/completions" if change == "save_unchanged" else "/new/v1/chat/completions"
+                            self.assertEqual(paths, ["/v1/chat/completions", expected_path])
+                        finally:
+                            release_second.set()
+                            stream.close()
+
+    def test_retired_clients_close_after_all_models_release_them(self) -> None:
+        settings = {"baseurl": "http://127.0.0.1:8045/v1", "model": "test", "apikey": "EMPTY"}
+        with patch.object(agent, "get_llm_settings", return_value=settings):
+            first = agent.build_llm()
+            second = agent.build_llm()
+        sync_client, async_client = first.http_client, first.http_async_client
+        self.assertIs(sync_client, second.http_client)
+        agent.invalidate_settings()
+        del first
+        gc.collect()
+        self.assertFalse(sync_client.is_closed)
+        self.assertFalse(async_client.is_closed)
+        del second
+        gc.collect()
+        self.assertTrue(sync_client.is_closed)
+        self.assertTrue(async_client.is_closed)
+
     def test_error_classification_and_key_redaction(self) -> None:
         secret = "sk-super-secret-token-value"
         err_401 = RuntimeError(f"Error code: 401 - Invalid Authorization Bearer {secret}")
@@ -304,6 +397,7 @@ class WzypPlatformTests(unittest.TestCase):
             os.environ,
             {
                 "WZYP_16688_DB": self.db_16688,
+                **{key: str(Path(self.temp_dir.name)/(key+".sqlite3")) for key in ["WZYP_CATFK_DB","WZYP_DUJIAO_NEXT_DB","WZYP_DUJIAOKA_DB","WZYP_YIKE_DB","WZYP_DISCOVERY_DB"]},
                 "WZYP_LIVE_DB": self.db_wzyp,
                 "WZYP_SQLITE_DB": self.db_wzyp,
             },
@@ -421,6 +515,41 @@ class WzypPlatformTests(unittest.TestCase):
             self.assertEqual(row["category_name"], "激活码")
             self.assertIsNone(row["stock_quantity"])
             self.assertIsNone(row["stock_status"])
+
+    def test_missing_or_invalid_page_totals_preserve_existing_snapshot(self) -> None:
+        token = "TOTAL01X"
+        initial_page = {"total": 1, "list": [{"goods_key": "G1", "name": "原商品", "price": 10}]}
+        shops = {token: make_open_shop(token, goods_pages={"card": {1: initial_page}})}
+        url = f"https://wzyp.cn/shop/{token}"
+        platformwzyp.sync_shop(url, session=FakeWzypSession(shops), store_path=self.db_wzyp)
+        before = local_store.readonly_query("SELECT * FROM wzyp_goods", path=self.db_wzyp)
+        details_before = local_store.readonly_query("SELECT * FROM wzyp_goods_detail", path=self.db_wzyp)
+        broken_pages = [{"list": []}] + [
+            {"list": [], "total": value} for value in (None, "", True, -1, "invalid")
+        ]
+        for page in broken_pages:
+            with self.subTest(page=page):
+                shops[token]["goods_pages"]["card"] = {1: page}
+                with self.assertRaises(platformwzyp.PlatformError):
+                    platformwzyp.sync_shop(url, session=FakeWzypSession(shops), store_path=self.db_wzyp)
+                self.assertEqual(local_store.readonly_query("SELECT * FROM wzyp_goods", path=self.db_wzyp), before)
+                self.assertEqual(local_store.readonly_query("SELECT * FROM wzyp_goods_detail", path=self.db_wzyp), details_before)
+
+    def test_missing_total_on_later_page_preserves_existing_snapshot(self) -> None:
+        token = "TOTAL02X"
+        initial_page = {"total": 1, "list": [{"goods_key": "G1", "name": "原商品", "price": 10}]}
+        shops = {token: make_open_shop(token, goods_pages={"card": {1: initial_page}})}
+        url = f"https://wzyp.cn/shop/{token}"
+        platformwzyp.sync_shop(url, session=FakeWzypSession(shops), store_path=self.db_wzyp)
+        before = local_store.readonly_query("SELECT * FROM wzyp_goods", path=self.db_wzyp)
+        items = [{"goods_key": f"NEW{i}", "name": f"新商品{i}", "price": 20} for i in range(21)]
+        shops[token]["goods_pages"]["card"] = {
+            1: {"total": 21, "list": items[:20]},
+            2: {"list": items[20:]},
+        }
+        with self.assertRaises(platformwzyp.PlatformError):
+            platformwzyp.sync_shop(url, session=FakeWzypSession(shops), store_path=self.db_wzyp)
+        self.assertEqual(local_store.readonly_query("SELECT * FROM wzyp_goods", path=self.db_wzyp), before)
 
     def test_count_change_retries_once_and_preserves_snapshot_on_persistent_mismatch(self) -> None:
         token = "0C0164X"
@@ -603,6 +732,7 @@ class WzypPlatformTests(unittest.TestCase):
         manager = CrawlManager(
             path=self.db_wzyp,
             session_factory=lambda stop=None: BlockableSession(shops_data),
+            workflow_version=1,  # Existing interrupted checkpoints keep the original pipeline.
             discover=lambda session, progress=None: [f"https://wzyp.cn/shop/{t1}", f"https://wzyp.cn/shop/{t2}"],
             platform_adapter=platformwzyp,
         )
@@ -625,7 +755,7 @@ class WzypPlatformTests(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_api_routes_and_source_isolation_across_three_sources(self) -> None:
+    def test_api_routes_and_source_isolation_across_two_sources(self) -> None:
         t_wzyp = "WZYP999X"
         platformwzyp.sync_shop(
             f"https://wzyp.cn/shop/{t_wzyp}",
@@ -651,9 +781,10 @@ class WzypPlatformTests(unittest.TestCase):
         with TestClient(server.app) as client:
             sources = client.get("/api/sources").json()["sources"]
             source_ids = [s["id"] for s in sources]
-            self.assertIn("16688", source_ids)
-            self.assertIn("wzyp-live", source_ids)
-            self.assertIn("wzyp", source_ids)
+            self.assertEqual(source_ids, ["wzyp-live", "16688", "dujiao-next", "dujiaoka", "catfk", "yike"])
+            self.assertEqual([s["name"] for s in sources], ["链动小铺", "16688 交易平台", "Dujiao-Next", "独角数卡", "云猫寄售", "一可比价网"])
+            self.assertFalse(sources[-1]["discovery"])
+            self.assertTrue(sources[-1]["keyword_crawl"])
 
             stats_wzyp_live = client.get("/api/stats?source=wzyp-live").json()
             self.assertEqual(stats_wzyp_live["stats"]["shop_count"], 1)
@@ -665,6 +796,65 @@ class WzypPlatformTests(unittest.TestCase):
             goods_resp = client.post("/api/goods?source=wzyp-live", json={"page": 1, "pageSize": 10}).json()
             self.assertEqual(goods_resp["total"], 1)
             self.assertEqual(goods_resp["rows"][0]["goods_key"], "WGOOD1")
+
+
+class CurlResponseTests(unittest.TestCase):
+    def test_real_curl_preserves_retry_after_and_response_body(self) -> None:
+        body = '{"message":"稍后重试"}'.encode("utf-8")
+
+        class RetryHandler(BaseHTTPRequestHandler):
+            hits = 0
+
+            def do_GET(self):
+                type(self).hits += 1
+                self.send_response(429 if type(self).hits == 1 else 200)
+                self.send_header("retry-after", "45")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        limiter = Mock()
+        with local_http_server(RetryHandler) as httpd, patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}):
+            with public_http.CurlSession(limiter=limiter) as session:
+                response = session.get(f"http://127.0.0.1:{httpd.server_port}", expect_json=True)
+        self.assertEqual(RetryHandler.hits, 2)
+        limiter.defer.assert_called_once_with(45)
+        self.assertEqual(response.headers.get("Retry-After"), "45")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, body)
+
+    def test_redirect_headers_do_not_override_final_response_headers(self) -> None:
+        body = b'{"ok":true}'
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/final")
+                    self.send_header("Retry-After", "60")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.send_header("X-Final", "yes")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        with local_http_server(RedirectHandler) as httpd, patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}):
+            with public_http.CurlSession(limiter=Mock()) as session:
+                response = session.get(f"http://127.0.0.1:{httpd.server_port}/redirect", allow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("x-final"), "yes")
+        self.assertNotIn("Retry-After", response.headers)
+        self.assertEqual(response.content, body)
 
 
 if __name__ == "__main__":
